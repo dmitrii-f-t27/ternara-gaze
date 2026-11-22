@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ternara-gaze"
+version = "0.1.0"
+description = "Privacy-first FPGA-native ternary AI eye-tracking mouse (Q27 / 0-DSP / pack5 / on-chip calibration)"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+train = ["torch>=2.0"]
+uart = ["pyserial>=3.5"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+ternara-gaze = "ternara_gaze.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ternara_gaze*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

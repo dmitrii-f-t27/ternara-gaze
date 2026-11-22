@@ -1,0 +1,44 @@
+// Ternara-Gaze v0 — Clean-Room Q27 Hardware Kernel Specification (v0.3 pack5 profile)
+// Generated from cartridge sha256: 4880d251656ab76a7dfbaafc965adefdbbe3725b78bec9a8564e99daea56889e
+// Hardware invariants:
+//   - 0 DSP slices, 0 floating-point units, 0 external DRAM
+//   - Strict 8-bit BRAM ROM lanes (radix-243 pack5: 5 trits/byte; bytes > 242 raise FAULT)
+//   - Input: 2x (16x32) 4-bit grayscale eye ROIs = 512 bytes packed nibbles
+//   - Mean centering via exact right-shift >> 9 (16*32 = 512 = 2^9; zero dividers)
+//   - Topology: 256 -> 64 (>>5) -> 32 (>>4) -> 4
+//   - Total weights: 18560 trits (3712 pack5 bytes; zero sparsity 44.7%)
+
+module ternara_gaze_core
+  param IN_DIM  = 256
+  param H1_DIM  = 64
+  param H2_DIM  = 32
+  param OUT_DIM = 4
+  param SHIFT_1 = 5
+  param SHIFT_2 = 4
+  param PACK5_BYTES = 3712
+
+  rom8  weights_pack5[PACK5_BYTES] = "ternara_gaze_pack5.hex"
+  rom16 biases_i16[100] = "ternara_gaze_biases_i16.hex"
+
+  // Step 1: Stream dual 16x32 u4 eye crops -> 2x2 sum pool - (sum >> 9) << 2 -> int7[256]
+  stage feature_extract(left_u4[512], right_u4[512]) -> x[256]:
+    for eye in 0..1:
+      mean = (sum_all(eye) >> 9)
+      for r in 0..7, c in 0..15:
+        x[eye*128 + r*16 + c] = clamp_i7(pool2x2_sum(eye, r, c) - (mean << 2))
+
+  // Step 2: Multiplication-free ternary layers (add / sub / skip only)
+  stage layer1(x[256]) -> h1[64]:
+    for o in 0..63:
+      acc = biases_i16[o] + ternary_dot_pack5(weights_pack5, o * 256, x, 256)
+      h1[o] = clamp_u7(acc >> SHIFT_1)
+
+  stage layer2(h1[64]) -> h2[32]:
+    for o in 0..31:
+      acc = biases_i16[64 + o] + ternary_dot_pack5(weights_pack5, 16384 + o * 64, h1, 64)
+      h2[o] = clamp_u7(acc >> SHIFT_2)
+
+  stage head(h2[32]) -> out[4]:
+    for o in 0..3:
+      out[o] = biases_i16[96 + o] + ternary_dot_pack5(weights_pack5, 18432 + o * 32, h2, 32)
+end

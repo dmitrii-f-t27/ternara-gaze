@@ -1,0 +1,40 @@
+{
+  "ax7203_xc7a200t": {
+    "board": "ALINX AX7203 (XC7A200T)",
+    "clock_mhz": 25.0,
+    "lanes_parallel": 16,
+    "total_trits": 18560,
+    "pack5_bytes": 3712,
+    "bias_bytes": 200,
+    "total_rom_bytes": 3912,
+    "bram_blocks_used": 1,
+    "bram_blocks_total": 365,
+    "bram_block_type": "RAMB36E1 (strict 8-bit lane, 0 parity reliance)",
+    "dsp_used": 0,
+    "dram_bytes_used": 0,
+    "cycles_per_frame": 1236,
+    "latency_us": 49.44,
+    "max_fps": 20226.5,
+    "est_lut_count": 2218,
+    "est_lut_pct": 1.65
+  },
+  "ecp5_85f": {
+    "board": "Lattice ECP5-85F (Kickstarter Target)",
+    "clock_mhz": 25.0,
+    "lanes_parallel": 16,
+    "total_trits": 18560,
+    "pack5_bytes": 3712,
+    "bias_bytes": 200,
+    "total_rom_bytes": 3912,
+    "bram_blocks_used": 2,
+    "bram_blocks_total": 208,
+    "bram_block_type": "DP16KD EBR (strict 8-bit lane)",
+    "dsp_used": 0,
+    "dram_bytes_used": 0,
+    "cycles_per_frame": 1236,
+    "latency_us": 49.44,
+    "max_fps": 20226.5,
+    "est_lut_count": 3216,
+    "est_lut_pct": 3.85
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "cartridge_path": "/Volumes/SSDD/Ternara/ternara-gaze-2026-11-22/weights/ternara_gaze_v0.tgaze.bin",
+  "sha256": "4880d251656ab76a7dfbaafc965adefdbbe3725b78bec9a8564e99daea56889e",
+  "cartridge_bytes": 3944,
+  "total_trits": 18560,
+  "zero_fraction": 0.4467,
+  "val_gaze_mae_norm": 0.112,
+  "val_blink_left_acc": 0.9922,
+  "val_blink_right_acc": 0.9953,
+  "bit_exact_oracle_checked": 32,
+  "bit_exact_max_diff": 0,
+  "wall_seconds": 2.03
+}
