@@ -13,8 +13,8 @@ Control your cursor with your eyes and click with a deliberate blink or wink —
 - **Hardware-enforced privacy:** Only two `32×16` 4-bit grayscale eye ROIs (`512 bytes`) enter the inference core; on the autonomous FPGA build, the host OS only ever sees standard **USB-HID mouse/eye-tracker coordinates** — raw camera imagery never touches the operating system.
 - **0 DSP, 0 DRAM, `< 4 KB` weights:** `18,560` ternary weights (`44.7%` natural zero sparsity) pack into **`3,712 bytes`** using strict 8-bit `pack5` lanes (`3^5 = 243 < 256`, zero 9-bit parity-lane hazards). Total cartridge `.tgaze.bin` with `int16` biases + header + CRC32 is **`3,944 bytes`** — fitting inside **1 `RAMB36E1`** on Artix-7 or **2 `EBR` blocks** on Lattice ECP5-85F.
 - **Sub-50 µs core latency @ 25 MHz:** Multiplication-free ternary adder tree (`+`, `-`, skip only) completes a full frame in `1,236 cycles = 49.44 µs` (`> 20,000 FPS` compute ceiling).
-- **On-chip compatible 9-point calibration:** Adapts a pure-integer `Q12` readout head on top of the frozen 32-dim ternary backbone in ~5 seconds for your glasses, seating distance, and monitor.
-- **Safe ergonomics:** Rejects involuntary reflex blinks (`< 180 ms`), freezes cursor during deliberate blinks (`260–750 ms` → left click; right wink → right click), ignores long eye-rest closures (`> 850 ms`), and immediately yields for `1.5 s` whenever you touch your physical trackpad/mouse.
+- **13-point corner-first `Q12` calibration:** Pins the **4 true screen corners first** (plus center, edges, and inner quadrants) using 14 physically orthogonal integer features (sub-pixel pupil offsets + Q27 backbone + head position/yaw/pitch + mild quadratic terms) with per-target MAD outlier rejection and an on-screen visual target banner.
+- **Non-invasive floating second cursor (Computer-Use style):** Renders an independent 60 FPS transparent click-through cyan reticle that follows your eyes while leaving your physical mouse/trackpad 100% free; deliberate blinks (`260–750 ms`) or left/right winks perform an atomic click at the reticle and immediately restore your physical pointer.
 
 ---
 
@@ -30,7 +30,7 @@ Control your cursor with your eyes and click with a deliberate blink or wink —
   256 ──► 64 (>>5, int7 ReLU) ──► 32 (>>4, int7 ReLU) ──► 4 (gaze_x, gaze_y, blink_L, blink_R)
                                     │
                                     ▼  32-dim int8 penultimate features
-[Pure-Integer Q12 9-Point Calibrator]  ──► screen (x_u16, y_u16)
+[Pure-Integer Q12 13-Point Corner-First Calibrator] ──► floating 2nd cursor (x_u16, y_u16)
         ▼
 [Fixed-Point 1-Euro Filter + Safe Blink/Wink State Machine]
         ▼
@@ -71,17 +71,17 @@ pytest -v
 bash macos/build_macos.sh
 ```
 
-### 3. Calibrate (9 points, ~15 seconds) & run live gaze mouse
+### 3. Calibrate (13 corner-first points, ~28 seconds) & run live second cursor
 > Grant **Camera** and **Accessibility** permissions to your terminal app in *System Settings → Privacy & Security*.
 
 ```bash
-# 9-point personal calibration (saves pure-integer Q12 weights to weights/user_calibration.json)
+# 13-point corner-first visual calibration (saves pure-integer Q12 v2 weights to weights/user_calibration.json)
 python3 -m ternara_gaze.cli calibrate
 
-# Dry-run first (prints gaze + blink telemetry without moving your cursor)
+# Preview mode (floating cyan second cursor only, clicks disabled)
 python3 -m ternara_gaze.cli run
 
-# Live cursor control (deliberate 300-600ms blink or left wink = Left Click; right wink = Right Click)
+# Live floating second cursor + atomic clicks (deliberate blink/left wink = Left Click; right wink = Right Click)
 # Touch your trackpad/mouse anytime to pause gaze control automatically, or press Ctrl+C to stop.
 python3 -m ternara_gaze.cli run --live
 ```
@@ -103,7 +103,7 @@ python3 -m ternara_gaze.cli train --output weights/ternara_gaze_v0.tgaze.bin --e
 
 ## Roadmap
 
-- [x] **V0 (This Release):** Bit-exact 0-DSP ternary gaze+blink model, `pack5` radix-243 cartridge (`< 4 KB`), pure-integer Q12 9-point calibration, safe blink-click filter, framed UART protocol, clean-room Q27 hardware export, and native zero-OpenCV macOS live mouse bridge.
+- [x] **V0 (This Release):** Bit-exact 0-DSP ternary gaze+blink model, `pack5` radix-243 cartridge (`< 4 KB`), 13-point corner-first pure-integer `Q12` calibration, smooth 60 FPS floating second cursor with atomic clicks, framed UART protocol, clean-room Q27 hardware export, and native zero-OpenCV macOS bridge.
 - [ ] **V0.5 (Live AX7203 FPGA):** Synthesize `ternara_gaze_core` with Vivado-free `q27rtl2` (`openXC7`), verify byte-exact board lockstep over UART, and demonstrate `< 125 ms` hot weight-cartridge swaps via `q27_bitpack`.
 - [ ] **V1 (Autonomous Hardware Prototype — ECP5-85F / Artix-7):** Direct IR camera sensor (`OV2640`/`OV7670` + `850 nm` LEDs) → FPGA `Q27` inference → native **USB-IF Eye Tracking HID** output with zero host software required.
 

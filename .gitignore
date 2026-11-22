@@ -8,3 +8,5 @@ build/*.o
 .DS_Store
 .env
 *.local.json
+weights/user_calibration.json
+launch_gaze_test.command

@@ -1,4 +1,4 @@
-"""Command-line interface for Ternara-Gaze (with floating second virtual cursor)."""
+"""Command-line interface for Ternara-Gaze (13-point corner-first calibration + floating second cursor)."""
 
 from __future__ import annotations
 
@@ -8,14 +8,16 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .calibrator import (
-    NINE_POINT_GRID_NORM,
+    CORNER_FIRST_GRID,
     IntegerGazeCalibrator,
     build_cal_feature,
+    dark_pupil_centroid_int,
+    filter_target_outliers,
 )
 from .cursor_filter import FilterConfig, GazeCursorController
 from .oracle import oracle_forward_pure, unpack_dual_eye_nibbles
@@ -28,6 +30,25 @@ from .uart_bridge import FpgaUartBackend, GazeInferenceBackend, OracleLoopbackBa
 DEFAULT_WEIGHTS = Path("weights/ternara_gaze_v0.tgaze.bin")
 DEFAULT_CAL = Path("weights/user_calibration.json")
 DEFAULT_BRIDGE = Path("build/gaze_bridge")
+
+
+def _extract_eye_kinematics(
+    msg: Dict[str, object], left_u4: np.ndarray, right_u4: np.ndarray
+) -> Tuple[int, int, int, int, int, int, int, int]:
+    """Extract (head_x, head_y, pup_lx, pup_ly, pup_rx, pup_ry, yaw, pitch) with pure-integer pupil fallback."""
+    head_x = int(msg.get("head_x", 0))
+    head_y = int(msg.get("head_y", 0))
+    yaw = int(msg.get("yaw", 0))
+    pitch = int(msg.get("pitch", 0))
+    pup_lx = int(msg.get("pup_lx", 0))
+    pup_ly = int(msg.get("pup_ly", 0))
+    pup_rx = int(msg.get("pup_rx", 0))
+    pup_ry = int(msg.get("pup_ry", 0))
+    if pup_lx == 0 and pup_ly == 0:
+        pup_lx, pup_ly = dark_pupil_centroid_int(left_u4)
+    if pup_rx == 0 and pup_ry == 0:
+        pup_rx, pup_ry = dark_pupil_centroid_int(right_u4)
+    return head_x, head_y, pup_lx, pup_ly, pup_rx, pup_ry, yaw, pitch
 
 
 def _make_backend(args: argparse.Namespace, cartridge: Optional[TernaryCartridge]) -> GazeInferenceBackend:
@@ -121,7 +142,9 @@ def cmd_demo_sim(args: argparse.Namespace) -> int:
     cal_tgts = []
     for i in open_idx[:36]:
         out = backend.infer(ds.left_u4[i], ds.right_u4[i], want_h2=True)
-        cal_feats.append(build_cal_feature(out.h2, out.gaze_x, out.gaze_y, 0, 0))
+        plx, ply = dark_pupil_centroid_int(ds.left_u4[i])
+        prx, pry = dark_pupil_centroid_int(ds.right_u4[i])
+        cal_feats.append(build_cal_feature(out.h2, out.gaze_x, out.gaze_y, 0, 0, plx, ply, prx, pry, 0, 0))
         gx, gy = float(ds.targets[i, 0]), float(ds.targets[i, 1])
         cal_tgts.append(((gx + 1.0) * 0.5, (gy + 1.0) * 0.5))
     cal = IntegerGazeCalibrator.fit(cal_feats, cal_tgts)
@@ -132,10 +155,12 @@ def cmd_demo_sim(args: argparse.Namespace) -> int:
     for step_idx in range(25):
         i = open_idx[step_idx % len(open_idx)]
         out = backend.infer(ds.left_u4[i], ds.right_u4[i], want_h2=True)
+        plx, ply = dark_pupil_centroid_int(ds.left_u4[i])
+        prx, pry = dark_pupil_centroid_int(ds.right_u4[i])
         bl, br = out.blink_left, out.blink_right
         if 10 <= step_idx <= 16:
             bl, br = 40, 40
-        sx, sy = cal.predict_u16(out.h2, out.gaze_x, out.gaze_y, 0, 0)
+        sx, sy = cal.predict_u16(out.h2, out.gaze_x, out.gaze_y, 0, 0, plx, ply, prx, pry, 0, 0)
         dec = ctrl.step(sx, sy, bl, br, now_ms)
         if dec.click != "none":
             clicks += 1
@@ -143,6 +168,8 @@ def cmd_demo_sim(args: argparse.Namespace) -> int:
     print(json.dumps({
         "demo": "synthetic_end_to_end",
         "calibrated_samples": len(cal_feats),
+        "fit_mae_pct_x": cal.fit_mae_pct_x,
+        "fit_mae_pct_y": cal.fit_mae_pct_y,
         "frames_simulated": 25,
         "final_cursor_u16": [dec.x_u16, dec.y_u16],
         "deliberate_blink_clicks_detected": clicks,
@@ -167,13 +194,9 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     cart = TernaryCartridge.load(args.weights) if args.backend == "oracle" else None
     backend = _make_backend(args, cart)
 
-    labels = [
-        "TOP-LEFT", "TOP-CENTER", "TOP-RIGHT",
-        "MIDDLE-LEFT", "CENTER", "MIDDLE-RIGHT",
-        "BOTTOM-LEFT", "BOTTOM-CENTER", "BOTTOM-RIGHT",
-    ]
-    print("Ternara-Gaze 9-Point Visual Calibration (zero raw video saved)", flush=True)
-    print("Look straight at the glowing green target dot on your screen.\n", flush=True)
+    print("Ternara-Gaze 13-Point Corner-First Visual Calibration (zero raw video saved)", flush=True)
+    print("Keep your head natural and look straight at the glowing green target dot.", flush=True)
+    print("Phase 1: 4 extreme screen corners -> Phase 2: center & edges -> Phase 3: inner quadrants.\n", flush=True)
 
     proc = subprocess.Popen(
         [str(bridge), "--overlay"],
@@ -184,42 +207,59 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         bufsize=1,
     )
     assert proc.stdout is not None and proc.stdin is not None
-    feats: List[np.ndarray] = []
-    targets: List[Tuple[float, float]] = []
+
+    all_feats: List[np.ndarray] = []
+    all_targets: List[Tuple[float, float]] = []
+    all_weights: List[float] = []
     open_bl: List[int] = []
     open_br: List[int] = []
+    raw_total = 0
+
+    settle_sec = 0.85
+    capture_sec = 1.35
+    total_sec = settle_sec + capture_sec
 
     try:
-        for (tx, ty), name in zip(NINE_POINT_GRID_NORM, labels):
-            tx_u16 = int(tx * 65535)
-            ty_u16 = int(ty * 65535)
-            print(f"  -> Look at {name:14s} glowing dot...", flush=True)
-            proc.stdin.write(f"T {tx_u16} {ty_u16} 0\n")
+        for idx, (tx, ty, label) in enumerate(CORNER_FIRST_GRID):
+            tx_u16 = int(round(tx * 65535))
+            ty_u16 = int(round(ty * 65535))
+            print(f"  -> {label:28s} ({int(tx * 100):2d}%, {int(ty * 100):2d}%) ...", flush=True)
+            proc.stdin.write(f"T {tx_u16} {ty_u16} 0 {label}\n")
             proc.stdin.flush()
 
             t_start = time.monotonic()
-            collected = 0
+            point_feats: List[np.ndarray] = []
             while True:
                 elapsed = time.monotonic() - t_start
-                if elapsed >= 1.9:
+                if elapsed >= total_sec:
                     break
                 line = proc.stdout.readline()
                 if not line:
                     raise SystemExit("Camera bridge stopped unexpectedly.")
-                pct = 0 if elapsed < 0.6 else min(100, int((elapsed - 0.6) / 1.3 * 100))
-                proc.stdin.write(f"T {tx_u16} {ty_u16} {pct}\n")
+                pct = 0 if elapsed < settle_sec else min(100, int((elapsed - settle_sec) / capture_sec * 100))
+                proc.stdin.write(f"T {tx_u16} {ty_u16} {pct} {label}\n")
                 proc.stdin.flush()
-                if elapsed < 0.6:
+                if elapsed < settle_sec:
                     continue
                 msg = json.loads(line)
                 left_u4, right_u4 = unpack_dual_eye_nibbles(bytes.fromhex(msg["eyes_hex"]))
                 out = backend.infer(left_u4, right_u4, want_h2=True)
-                feats.append(build_cal_feature(out.h2, out.gaze_x, out.gaze_y, msg["head_x"], msg["head_y"]))
-                targets.append((tx, ty))
+                hx, hy, plx, ply, prx, pry, yaw, pitch = _extract_eye_kinematics(msg, left_u4, right_u4)
+                point_feats.append(
+                    build_cal_feature(out.h2, out.gaze_x, out.gaze_y, hx, hy, plx, ply, prx, pry, yaw, pitch)
+                )
                 open_bl.append(out.blink_left)
                 open_br.append(out.blink_right)
-                collected += 1
-            print(f"     captured {collected} frames", flush=True)
+                raw_total += 1
+
+            kept = filter_target_outliers(point_feats, keep_ratio=0.65)
+            # Pin the 4 extreme corners firmly, then edges/center, then inner quadrants
+            point_weight = 2.5 if idx < 4 else (1.4 if idx < 9 else 1.0)
+            for f in kept:
+                all_feats.append(f)
+                all_targets.append((tx, ty))
+                all_weights.append(point_weight)
+            print(f"     captured {len(point_feats)} frames -> kept {len(kept)} stable frames", flush=True)
     finally:
         try:
             proc.stdin.write("Q\n")
@@ -229,14 +269,32 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         proc.terminate()
         proc.wait(timeout=3)
 
-    if len(feats) < 12:
-        raise SystemExit(f"Too few frames captured ({len(feats)}). Ensure good lighting and retry.")
+    if len(all_feats) < 16:
+        raise SystemExit(f"Too few stable frames captured ({len(all_feats)}). Ensure good lighting and retry.")
 
     tl = int(np.percentile(open_bl, 95)) + 24
     tr = int(np.percentile(open_br, 95)) + 24
-    cal = IntegerGazeCalibrator.fit(feats, targets, ridge_lambda=4000.0, blink_thresh_l=tl, blink_thresh_r=tr)
+    cal = IntegerGazeCalibrator.fit(
+        all_feats,
+        all_targets,
+        ridge_lambda=1200.0,
+        blink_thresh_l=tl,
+        blink_thresh_r=tr,
+        sample_weights=all_weights,
+    )
     cal.save(args.cal_out)
-    print(f"\nSaved Q12 calibration ({len(feats)} samples, blink_thresh=({tl},{tr})) -> {args.cal_out}", flush=True)
+    print(
+        f"\nSaved Q12 v2 corner-first calibration -> {args.cal_out}\n"
+        f"  Stable samples : {len(all_feats)} / {raw_total} raw frames across 13 targets\n"
+        f"  Fit accuracy   : MAE X = {cal.fit_mae_pct_x:.2f}% | MAE Y = {cal.fit_mae_pct_y:.2f}% of screen\n"
+        f"  Blink thresh   : left={tl}, right={tr}",
+        flush=True,
+    )
+    if cal.fit_mae_pct_x > 10.0 or cal.fit_mae_pct_y > 12.0:
+        print(
+            "  Tip: MAE is a bit high — make sure light hits your face evenly and re-run `calibrate` if needed.",
+            flush=True,
+        )
     return 0
 
 
@@ -247,8 +305,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     cal_path = Path(args.calibration)
     if cal_path.exists():
-        cal = IntegerGazeCalibrator.load(cal_path)
-        print(f"Loaded calibration: {cal_path}", flush=True)
+        try:
+            cal = IntegerGazeCalibrator.load(cal_path)
+            print(
+                f"Loaded Q12 v2 calibration: {cal_path} "
+                f"(fit MAE X={cal.fit_mae_pct_x:.2f}%, Y={cal.fit_mae_pct_y:.2f}%)",
+                flush=True,
+            )
+        except ValueError as exc:
+            print(f"Warning: {exc} Falling back to default map.", flush=True)
+            cal = IntegerGazeCalibrator.identity_default()
     else:
         cal = IntegerGazeCalibrator.identity_default()
         print("No user calibration found; using default map (run `calibrate` first for best accuracy).", flush=True)
@@ -288,7 +354,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
             left_u4, right_u4 = unpack_dual_eye_nibbles(bytes.fromhex(msg["eyes_hex"]))
             out = backend.infer(left_u4, right_u4, want_h2=True)
-            sx, sy = cal.predict_u16(out.h2, out.gaze_x, out.gaze_y, msg["head_x"], msg["head_y"])
+            hx, hy, plx, ply, prx, pry, yaw, pitch = _extract_eye_kinematics(msg, left_u4, right_u4)
+            sx, sy = cal.predict_u16(out.h2, out.gaze_x, out.gaze_y, hx, hy, plx, ply, prx, pry, yaw, pitch)
             dec = ctrl.step(sx, sy, out.blink_left, out.blink_right, now_ms)
 
             # Always update the smooth floating second cursor (never hijacks your physical mouse)
@@ -302,7 +369,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             frames += 1
             if frames % 15 == 0 or dec.click != "none":
                 print(
-                    f"frame={frames:5d} raw=({out.gaze_x:+4d},{out.gaze_y:+4d}) "
+                    f"frame={frames:5d} pup=({plx:+4d},{ply:+4d}|{prx:+4d},{pry:+4d}) "
                     f"blink=({out.blink_left:+4d},{out.blink_right:+4d}) "
                     f"reticle=({dec.x_u16:5d},{dec.y_u16:5d}) click={dec.click}",
                     flush=True,
@@ -348,7 +415,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sim.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     p_sim.set_defaults(func=cmd_demo_sim)
 
-    p_cal = sub.add_parser("calibrate", help="Run 9-point visual on-screen calibration (macOS)")
+    p_cal = sub.add_parser("calibrate", help="Run 13-point corner-first visual on-screen calibration (macOS)")
     p_cal.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     p_cal.add_argument("--cal-out", default=str(DEFAULT_CAL))
     p_cal.add_argument("--bridge", default=str(DEFAULT_BRIDGE))

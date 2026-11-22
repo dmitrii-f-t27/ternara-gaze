@@ -6,11 +6,9 @@ import CoreGraphics
 import ApplicationServices
 
 // Ternara-Gaze Native macOS Camera + Floating Second Cursor Overlay + Atomic Computer-Use Click
-// - Your real physical mouse/trackpad is NEVER hijacked or fought over.
-// - A silky-smooth 60 FPS click-through virtual reticle follows your gaze.
-// - On blink/wink click, posts an atomic CGEvent click at the reticle position and immediately
-//   restores your physical mouse cursor to where you left it.
-// - During 9-point calibration, displays glowing on-screen target dots at the exact screen points.
+// - Extracts dual 32x16 4-bit eye ROIs (512B), sub-pixel relative pupil offsets, and head yaw/pitch
+// - Renders on-screen corner-first calibration targets with labels (no glancing away at Terminal)
+// - Renders a silky-smooth 60 FPS click-through second cursor; never hijacks your physical mouse
 
 let EYE_W = 32
 let EYE_H = 16
@@ -35,7 +33,6 @@ func currentMouseU16() -> (Int, Int) {
 }
 
 func atomicClickAtU16(xU16: Int, yU16: Int, right: Bool) {
-    // Save user's real physical mouse position, click cleanly at gaze reticle, restore real mouse!
     let savedLoc = CGEvent(source: nil)?.location
     let pt = u16ToCGPoint(xU16: xU16, yU16: yU16)
     let downType: CGEventType = right ? .rightMouseDown : .leftMouseDown
@@ -57,7 +54,7 @@ func atomicClickAtU16(xU16: Int, yU16: Int, right: Bool) {
     }
 }
 
-// MARK: - Native Floating Overlay (Second Cursor + Calibration Targets)
+// MARK: - Native Floating Overlay
 
 final class GazeOverlayView: NSView {
     var mode: String = "idle" // "idle", "gaze", "calibrate"
@@ -67,6 +64,7 @@ final class GazeOverlayView: NSView {
     var renderY: CGFloat = 0.5
     var holdPct: CGFloat = 0.0
     var calPct: CGFloat = 0.0
+    var calLabel: String = ""
     var clickFlash: CGFloat = 0.0
     var clickWasRight: Bool = false
 
@@ -78,70 +76,84 @@ final class GazeOverlayView: NSView {
         let w = bounds.width
         let h = bounds.height
 
-        // AppKit origin is bottom-left; gaze Y=0 is top of screen
-        let px = renderX * w
-        let py = (1.0 - renderY) * h
-
         if mode == "calibrate" {
             let cx = targetX * w
             let cy = (1.0 - targetY) * h
-            // Outer halo
-            let outerR: CGFloat = 34
+
+            // Subtle dark pill banner at screen center-top so user never needs to look at Terminal
+            let bannerText = calLabel.isEmpty ? "TERNARA GAZE CALIBRATION — LOOK AT THE GREEN DOT" : "LOOK AT THE DOT:  \(calLabel)"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 18, weight: .bold),
+                .foregroundColor: NSColor.white,
+            ]
+            let attrStr = NSAttributedString(string: bannerText, attributes: attrs)
+            let sz = attrStr.size()
+            let pillW = sz.width + 36
+            let pillH = sz.height + 18
+            let pillY = targetY < 0.25 ? (h * 0.50 - pillH * 0.5) : (h - 90)
+            let pillRect = NSRect(x: (w - pillW) * 0.5, y: pillY, width: pillW, height: pillH)
+            let pill = NSBezierPath(roundedRect: pillRect, xRadius: 14, yRadius: 14)
+            NSColor(calibratedWhite: 0.06, alpha: 0.82).setFill()
+            pill.fill()
+            NSColor(calibratedRed: 0.10, green: 0.92, blue: 0.72, alpha: 0.85).setStroke()
+            pill.lineWidth = 1.8
+            pill.stroke()
+            attrStr.draw(at: NSPoint(x: pillRect.minX + 18, y: pillRect.minY + 9))
+
+            // Glowing corner/point target
+            let outerR: CGFloat = 30
             let outerRect = NSRect(x: cx - outerR, y: cy - outerR, width: outerR * 2, height: outerR * 2)
             let outer = NSBezierPath(ovalIn: outerRect)
-            NSColor(calibratedRed: 0.05, green: 0.85, blue: 0.65, alpha: 0.22).setFill()
+            NSColor(calibratedRed: 0.05, green: 0.88, blue: 0.65, alpha: 0.28).setFill()
             outer.fill()
-            NSColor(calibratedRed: 0.10, green: 0.95, blue: 0.75, alpha: 0.95).setStroke()
+            NSColor(calibratedRed: 0.12, green: 0.96, blue: 0.76, alpha: 0.98).setStroke()
             outer.lineWidth = 3.0
             outer.stroke()
 
-            // Progress arc
             if calPct > 0.01 {
                 let arc = NSBezierPath()
                 arc.appendArc(
                     withCenter: NSPoint(x: cx, y: cy),
-                    radius: outerR + 6,
+                    radius: outerR + 7,
                     startAngle: 90,
                     endAngle: 90 - 360 * calPct,
                     clockwise: true
                 )
-                NSColor(calibratedRed: 1.0, green: 0.82, blue: 0.15, alpha: 0.95).setStroke()
-                arc.lineWidth = 5.0
+                NSColor(calibratedRed: 1.0, green: 0.84, blue: 0.15, alpha: 0.98).setStroke()
+                arc.lineWidth = 5.5
                 arc.lineCapStyle = .round
                 arc.stroke()
             }
 
-            // Inner bright fixation dot
-            let dotR: CGFloat = 8
+            let dotR: CGFloat = 7.5
             let dot = NSBezierPath(ovalIn: NSRect(x: cx - dotR, y: cy - dotR, width: dotR * 2, height: dotR * 2))
             NSColor.white.setFill()
             dot.fill()
             return
         }
 
-        // Virtual Second Cursor ("Ternara Gaze Reticle")
-        let baseR: CGFloat = 18.0
+        // Floating Second Cursor ("Ternara Gaze Reticle")
+        let px = renderX * w
+        let py = (1.0 - renderY) * h
+        let baseR: CGFloat = 17.0
         let haloR: CGFloat = baseR + 10.0 * clickFlash
 
-        // Soft glow backdrop
         let glowRect = NSRect(x: px - haloR - 4, y: py - haloR - 4, width: (haloR + 4) * 2, height: (haloR + 4) * 2)
         let glow = NSBezierPath(ovalIn: glowRect)
         let ringColor: NSColor = clickFlash > 0.05
             ? (clickWasRight
                 ? NSColor(calibratedRed: 1.0, green: 0.45, blue: 0.20, alpha: 0.95)
                 : NSColor(calibratedRed: 0.15, green: 1.0, blue: 0.65, alpha: 0.95))
-            : NSColor(calibratedRed: 0.10, green: 0.88, blue: 0.98, alpha: 0.90)
+            : NSColor(calibratedRed: 0.10, green: 0.88, blue: 0.98, alpha: 0.92)
 
         ringColor.withAlphaComponent(0.16 + 0.22 * clickFlash).setFill()
         glow.fill()
 
-        // Main crisp reticle ring
         let ring = NSBezierPath(ovalIn: NSRect(x: px - baseR, y: py - baseR, width: baseR * 2, height: baseR * 2))
         ringColor.setStroke()
         ring.lineWidth = 2.6
         ring.stroke()
 
-        // Blink-click hold progress ring
         if holdPct > 0.02 {
             let arc = NSBezierPath()
             arc.appendArc(
@@ -157,7 +169,6 @@ final class GazeOverlayView: NSView {
             arc.stroke()
         }
 
-        // Crisp center pointer dot
         let dotR: CGFloat = 3.5
         let dot = NSBezierPath(ovalIn: NSRect(x: px - dotR, y: py - dotR, width: dotR * 2, height: dotR * 2))
         NSColor.white.setFill()
@@ -189,10 +200,9 @@ final class OverlayController {
         window.contentView = view
         window.orderFrontRegardless()
 
-        // 60 FPS butter-smooth spring interpolation on the virtual cursor
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            let lerp: CGFloat = 0.24
+            let lerp: CGFloat = 0.22
             self.view.renderX += (self.view.targetX - self.view.renderX) * lerp
             self.view.renderY += (self.view.targetY - self.view.renderY) * lerp
             if self.view.clickFlash > 0.01 {
@@ -213,12 +223,15 @@ final class OverlayController {
         }
     }
 
-    func updateCalTarget(xU16: Int, yU16: Int, pct: Int) {
+    func updateCalTarget(xU16: Int, yU16: Int, pct: Int, label: String) {
         DispatchQueue.main.async {
             self.view.mode = "calibrate"
             self.view.targetX = CGFloat(max(0, min(65535, xU16))) / 65535.0
             self.view.targetY = CGFloat(max(0, min(65535, yU16))) / 65535.0
             self.view.calPct = CGFloat(max(0, min(100, pct))) / 100.0
+            if !label.isEmpty {
+                self.view.calLabel = label
+            }
         }
     }
 
@@ -230,7 +243,7 @@ final class OverlayController {
     }
 }
 
-// MARK: - Eye ROI Extraction
+// MARK: - Eye ROI & Sub-Pixel Pupil Geometry
 
 func cropEyeU4(
     yBase: UnsafePointer<UInt8>,
@@ -279,6 +292,28 @@ func eyeBoxInImage(faceBox: CGRect, region: VNFaceLandmarkRegion2D) -> CGRect {
     let boxW = w * 1.65
     let boxH = max(h * 2.2, boxW * 0.5)
     return CGRect(x: cx - boxW * 0.5, y: cy - boxH * 0.5, width: boxW, height: boxH)
+}
+
+func relativePupilOffset(eye: VNFaceLandmarkRegion2D, pupil: VNFaceLandmarkRegion2D?) -> (Int, Int) {
+    guard let p = pupil?.normalizedPoints.first else { return (0, 0) }
+    let pts = eye.normalizedPoints
+    guard !pts.isEmpty else { return (0, 0) }
+    var minX: CGFloat = 1.0, maxX: CGFloat = 0.0
+    var minY: CGFloat = 1.0, maxY: CGFloat = 0.0
+    for pt in pts {
+        minX = min(minX, pt.x)
+        maxX = max(maxX, pt.x)
+        minY = min(minY, pt.y)
+        maxY = max(maxY, pt.y)
+    }
+    let w = max(0.005, maxX - minX)
+    let h = max(0.005, maxY - minY)
+    let cx = (minX + maxX) * 0.5
+    let cy = (minY + maxY) * 0.5
+    // Mirror X (front camera); invert Y so looking down is positive
+    let relX = -Double((p.x - cx) / w) * 256.0
+    let relY = -Double((p.y - cy) / h) * 256.0
+    return (max(-128, min(127, Int(relX))), max(-128, min(127, Int(relY))))
 }
 
 func packNibblesHex(left: [UInt8], right: [UInt8]) -> String {
@@ -331,6 +366,8 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
 
         let leftBox = eyeBoxInImage(faceBox: face.boundingBox, region: leftEye)
         let rightBox = eyeBoxInImage(faceBox: face.boundingBox, region: rightEye)
+        let (pupLX, pupLY) = relativePupilOffset(eye: leftEye, pupil: lm.leftPupil)
+        let (pupRX, pupRY) = relativePupilOffset(eye: rightEye, pupil: lm.rightPupil)
 
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
@@ -349,11 +386,18 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let faceCy = 1.0 - Double(face.boundingBox.midY)
         let headX = max(-128, min(127, Int((0.5 - faceCx) * 256.0)))
         let headY = max(-128, min(127, Int((faceCy - 0.5) * 256.0)))
+
+        // Vision yaw/pitch in radians -> scale to [-128, +127] (approx +-0.5 rad full range)
+        let yawRad = face.yaw?.doubleValue ?? 0.0
+        let pitchRad = face.pitch?.doubleValue ?? 0.0
+        let yawInt = max(-128, min(127, Int(-yawRad * 220.0)))
+        let pitchInt = max(-128, min(127, Int(pitchRad * 220.0)))
+
         let nowMs = Int((DispatchTime.now().uptimeNanoseconds - startTime) / 1_000_000)
         let (mx, my) = currentMouseU16()
         eyeFrames += 1
 
-        let line = "{\"seq\":\(eyeFrames),\"ts_ms\":\(nowMs),\"head_x\":\(headX),\"head_y\":\(headY),\"mx_u16\":\(mx),\"my_u16\":\(my),\"eyes_hex\":\"\(hexStr)\"}\n"
+        let line = "{\"seq\":\(eyeFrames),\"ts_ms\":\(nowMs),\"head_x\":\(headX),\"head_y\":\(headY),\"yaw\":\(yawInt),\"pitch\":\(pitchInt),\"pup_lx\":\(pupLX),\"pup_ly\":\(pupLY),\"pup_rx\":\(pupRX),\"pup_ry\":\(pupRY),\"mx_u16\":\(mx),\"my_u16\":\(my),\"eyes_hex\":\"\(hexStr)\"}\n"
         if let data = line.data(using: .utf8) {
             FileHandle.standardOutput.write(data)
         }
@@ -367,7 +411,7 @@ if args.contains("--self-test") {
     let b = screenBounds()
     let ax = AXIsProcessTrusted()
     let camAuth = AVCaptureDevice.authorizationStatus(for: .video).rawValue
-    print("{\"status\":\"ok\",\"screen_w\":\(Int(b.width)),\"screen_h\":\(Int(b.height)),\"eye_roi\":\"32x16x4bit\",\"overlay\":\"virtual_second_cursor\",\"accessibility_trusted\":\(ax),\"camera_auth\":\(camAuth)}")
+    print("{\"status\":\"ok\",\"screen_w\":\(Int(b.width)),\"screen_h\":\(Int(b.height)),\"eye_roi\":\"32x16x4bit\",\"overlay\":\"virtual_second_cursor_v2\",\"accessibility_trusted\":\(ax),\"camera_auth\":\(camAuth)}")
     exit(0)
 }
 
@@ -383,13 +427,14 @@ if overlayEnabled {
     overlay = OverlayController()
     DispatchQueue.global(qos: .userInteractive).async {
         while let line = readLine() {
-            let parts = line.split(separator: " ")
+            let parts = line.split(separator: " ", maxSplits: 4)
             guard let cmd = parts.first else { continue }
             if cmd == "G", parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]) {
                 let pct = parts.count >= 4 ? (Int(parts[3]) ?? 0) : 0
                 overlay?.updateGaze(xU16: x, yU16: y, holdPct: pct)
             } else if cmd == "T", parts.count >= 4, let x = Int(parts[1]), let y = Int(parts[2]), let pct = Int(parts[3]) {
-                overlay?.updateCalTarget(xU16: x, yU16: y, pct: pct)
+                let lbl = parts.count >= 5 ? String(parts[4]) : ""
+                overlay?.updateCalTarget(xU16: x, yU16: y, pct: pct, label: lbl)
             } else if cmd == "L", parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]) {
                 overlay?.triggerClickFlash(right: false)
                 if clicksEnabled {
