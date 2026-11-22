@@ -84,8 +84,8 @@ def _extract_eye_kinematics(
     msg: Dict[str, object], left_u4: np.ndarray, right_u4: np.ndarray
 ) -> Tuple[int, int, int, int, int, int, int, int]:
     """Extract (head_x, head_y, pup_lx, pup_ly, pup_rx, pup_ry, yaw, pitch) with pure-integer pupil fallback."""
-    head_x = int(msg.get("head_x", 0))
-    head_y = int(msg.get("head_y", 0))
+    head_x = int(msg.get("nose_x", msg.get("head_x", 0)))
+    head_y = int(msg.get("nose_y", msg.get("head_y", 0)))
     yaw = int(msg.get("yaw", 0))
     pitch = int(msg.get("pitch", 0))
     pup_lx = int(msg.get("pup_lx", 0))
@@ -275,8 +275,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     try:
         # Phase 0: Voice + On-Screen Intro Card + Live HD Eye-Lock verification (4.0 s)
         _speak_async(
-            "Запускаем тест калибровки глаз. Камера фиксирует ваши глаза. "
-            "Смотрите на зелёную точку, а когда кольцо станет золотым — моргните, чтобы перейти к следующей точке."
+            "Запускаем тест калибровки. Смотрите на зелёную точку и слегка поворачивайте нос в её сторону. "
+            "Когда кольцо станет золотым — моргните, чтобы перейти к следующей точке."
         )
         t_intro = time.monotonic()
         intro_dur = 4.2
@@ -439,31 +439,35 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     if len(all_feats) < 16:
         raise SystemExit(f"Too few stable frames captured ({len(all_feats)}). Ensure good lighting and retry.")
 
-    # Compute optimal open-vs-blink thresholds from real user blinks captured across the 13 points
-    open_bl_p90 = int(np.percentile(open_bl, 90)) if open_bl else 10
-    open_br_p90 = int(np.percentile(open_br, 90)) if open_br else 10
+    # Safe open-vs-blink thresholds: strictly separated from normal open eyes so cursor never false-freezes
+    open_bl_p95 = int(np.percentile(open_bl, 95)) if open_bl else 10
+    open_br_p95 = int(np.percentile(open_br, 95)) if open_br else 10
     if blink_bl_peaks:
-        tl = max(open_bl_p90 + 16, int((open_bl_p90 + int(np.median(blink_bl_peaks))) // 2))
-        tr = max(open_br_p90 + 16, int((open_br_p90 + int(np.median(blink_br_peaks))) // 2))
+        tl = max(open_bl_p95 + 22, int((open_bl_p95 + int(np.median(blink_bl_peaks))) // 2))
+        tr = max(open_br_p95 + 22, int((open_br_p95 + int(np.median(blink_br_peaks))) // 2))
     else:
-        tl = int(np.percentile(open_bl, 95)) + 24
-        tr = int(np.percentile(open_br, 95)) + 24
+        tl = open_bl_p95 + 26
+        tr = open_br_p95 + 26
 
-    open_el_p25 = int(np.percentile(open_ear_l, 25)) if open_ear_l else 230
-    open_er_p25 = int(np.percentile(open_ear_r, 25)) if open_ear_r else 230
+    open_el_med = int(np.median(open_ear_l)) if open_ear_l else 260
+    open_er_med = int(np.median(open_ear_r)) if open_ear_r else 260
+    open_el_p10 = int(np.percentile(open_ear_l, 10)) if open_ear_l else 210
+    open_er_p10 = int(np.percentile(open_ear_r, 10)) if open_ear_r else 210
+    max_safe_el = min(open_el_p10 - 35, int(open_el_med * 0.70))
+    max_safe_er = min(open_er_p10 - 35, int(open_er_med * 0.70))
     if blink_ear_l_mins:
-        ear_tl = min(open_el_p25 - 25, int((open_el_p25 + int(np.median(blink_ear_l_mins))) // 2))
-        ear_tr = min(open_er_p25 - 25, int((open_er_p25 + int(np.median(blink_ear_r_mins))) // 2))
-        ear_tl = max(70, ear_tl)
-        ear_tr = max(70, ear_tr)
+        mid_el = int((open_el_p10 + int(np.median(blink_ear_l_mins))) // 2)
+        mid_er = int((open_er_p10 + int(np.median(blink_ear_r_mins))) // 2)
+        ear_tl = max(65, min(max_safe_el, mid_el))
+        ear_tr = max(65, min(max_safe_er, mid_er))
     else:
-        ear_tl = max(70, int(open_el_p25 * 0.70))
-        ear_tr = max(70, int(open_er_p25 * 0.70))
+        ear_tl = max(65, max_safe_el)
+        ear_tr = max(65, max_safe_er)
 
     cal = IntegerGazeCalibrator.fit(
         all_feats,
         all_targets,
-        ridge_lambda=1400.0,
+        ridge_lambda=500.0,
         blink_thresh_l=tl,
         blink_thresh_r=tr,
         ear_thresh_l=ear_tl,
@@ -473,7 +477,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     cal.save(args.cal_out)
     _speak_async("Калибровка завершена. Включаю плавный второй курсор.")
     print(
-        f"\nSaved Q12 v2 HD Eye-Lock calibration -> {args.cal_out}\n"
+        f"\nSaved Q12 v3 Nose+Eye HD Lock calibration -> {args.cal_out}\n"
         f"  Stable samples : {len(all_feats)} / {raw_total} raw frames across 13 targets\n"
         f"  Fit accuracy   : MAE X = {cal.fit_mae_pct_x:.2f}% | MAE Y = {cal.fit_mae_pct_y:.2f}% of screen\n"
         f"  Blink thresh   : Q27=({tl},{tr}) | HD EAR=({ear_tl},{ear_tr}) (from {len(blink_ear_l_mins)} real blinks)",
@@ -492,7 +496,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         try:
             cal = IntegerGazeCalibrator.load(cal_path)
             print(
-                f"Loaded Q12 v2 calibration: {cal_path} "
+                f"Loaded Q12 v3 Nose+Eye calibration: {cal_path} "
                 f"(fit MAE X={cal.fit_mae_pct_x:.2f}%, Y={cal.fit_mae_pct_y:.2f}%, "
                 f"EAR=({cal.ear_thresh_l},{cal.ear_thresh_r}))",
                 flush=True,
@@ -551,7 +555,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             sx, sy = cal.predict_u16(out.h2, out.gaze_x, out.gaze_y, hx, hy, plx, ply, prx, pry, yaw, pitch)
             dec = ctrl.step(sx, sy, out.blink_left, out.blink_right, now_ms, ear_l=el, ear_r=er)
 
-            proc.stdin.write(f"G {dec.x_u16} {dec.y_u16} {dec.hold_progress_pct}\n")
+            proc.stdin.write(f"G {dec.x_u16} {dec.y_u16} {dec.hold_progress_pct} {1 if dec.locked else 0}\n")
             if dec.click == "left_click":
                 proc.stdin.write(f"L {dec.x_u16} {dec.y_u16}\n")
             elif dec.click == "right_click":
@@ -561,9 +565,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             frames += 1
             if frames % 15 == 0 or dec.click != "none":
                 print(
-                    f"frame={frames:5d} pup=({plx:+4d},{ply:+4d}|{prx:+4d},{pry:+4d}) "
+                    f"frame={frames:5d} nose=({hx:+4d},{hy:+4d}) pup=({plx:+4d},{ply:+4d}) "
                     f"pose=({yaw:+4d},{pitch:+4d}) ear=({el or 0:3d},{er or 0:3d}) "
-                    f"reticle=({dec.x_u16:5d},{dec.y_u16:5d}) click={dec.click}",
+                    f"reticle=({dec.x_u16:5d},{dec.y_u16:5d}) lock={int(dec.locked)} click={dec.click}",
                     flush=True,
                 )
     except KeyboardInterrupt:

@@ -21,12 +21,37 @@ func currentMouseU16() -> (Int, Int) {
     return (Int(nx * 65535.0), Int(ny * 65535.0))
 }
 
-func atomicClickAtU16(xU16: Int, yU16: Int, right: Bool) {
+func queryMagneticTargetRect(screenPt: CGPoint) -> CGRect? {
+    guard AXIsProcessTrusted() else { return nil }
+    let sysWide = AXUIElementCreateSystemWide()
+    var elem: AXUIElement?
+    let err = AXUIElementCopyElementAtPosition(sysWide, Float(screenPt.x), Float(screenPt.y), &elem)
+    guard err == .success, let el = elem else { return nil }
+
+    var posVal: CFTypeRef?
+    var sizeVal: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, kAXPositionAttribute as CFString, &posVal) == .success,
+          AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &sizeVal) == .success,
+          let pv = posVal, let sv = sizeVal,
+          CFGetTypeID(pv) == AXValueGetTypeID(),
+          CFGetTypeID(sv) == AXValueGetTypeID() else {
+        return nil
+    }
+    var pt = CGPoint.zero
+    var sz = CGSize.zero
+    AXValueGetValue(pv as! AXValue, .cgPoint, &pt)
+    AXValueGetValue(sv as! AXValue, .cgSize, &sz)
+
+    // Only magnetically snap to reasonably sized UI controls (buttons, Dock icons, tabs, links, fields)
+    if sz.width >= 16 && sz.width <= 340 && sz.height >= 16 && sz.height <= 125 {
+        return CGRect(origin: pt, size: sz)
+    }
+    return nil
+}
+
+func atomicClickAtPoint(target: CGPoint, right: Bool) {
     let b = screenBounds()
     let prevPt = CGEvent(source: nil)?.location ?? CGPoint(x: b.midX, y: b.midY)
-    let nx = Double(max(0, min(65535, xU16))) / 65535.0
-    let ny = Double(max(0, min(65535, yU16))) / 65535.0
-    let target = CGPoint(x: b.origin.x + nx * b.size.width, y: b.origin.y + ny * b.size.height)
 
     let downType: CGEventType = right ? .rightMouseDown : .leftMouseDown
     let upType: CGEventType = right ? .rightMouseUp : .leftMouseUp
@@ -45,7 +70,14 @@ func atomicClickAtU16(xU16: Int, yU16: Int, right: Bool) {
     CGWarpMouseCursorPosition(prevPt)
 }
 
-// MARK: - Smooth 60 FPS Floating Second Cursor + Live Eye-Lock HUD + Intro + Blink-to-Advance
+func u16ToScreenPoint(xU16: Int, yU16: Int) -> CGPoint {
+    let b = screenBounds()
+    let nx = Double(max(0, min(65535, xU16))) / 65535.0
+    let ny = Double(max(0, min(65535, yU16))) / 65535.0
+    return CGPoint(x: b.origin.x + nx * b.size.width, y: b.origin.y + ny * b.size.height)
+}
+
+// MARK: - Smooth 60 FPS Floating Second Cursor + Magnetic Region Lock + Nose/Eye HD HUD
 
 final class GazeOverlayView: NSView {
     var mode: String = "intro"   // "intro" | "calibrate" | "gaze"
@@ -54,19 +86,21 @@ final class GazeOverlayView: NSView {
     var renderX: CGFloat = 0.5
     var renderY: CGFloat = 0.5
     var holdPct: CGFloat = 0.0
+    var regionLocked: Bool = false
+    var snappedRect: CGRect? = nil  // in screen top-left coordinates
 
     var calPct: CGFloat = 0.0
     var calState: String = "AIM" // "AIM" | "REC" | "BLINK"
     var calLabel: String = ""
 
     var introStep: String = "3"
-    var introSubtitle: String = "Камера фиксирует область глаз в HD 720p"
+    var introSubtitle: String = "Камера HD 720p фиксирует нос и оба глаза"
 
     var clickFlash: CGFloat = 0.0
     var clickWasRight: Bool = false
     var pulsePhase: CGFloat = 0.0
 
-    // Live Eye-Lock telemetry (purely in RAM, never saved)
+    // Live Nose + Eye Lock telemetry (purely in RAM, zero video saved)
     var eyeLocked: Bool = false
     var leftEyeU4: [UInt8] = [UInt8](repeating: 0, count: EYE_W * EYE_H)
     var rightEyeU4: [UInt8] = [UInt8](repeating: 0, count: EYE_W * EYE_H)
@@ -74,6 +108,8 @@ final class GazeOverlayView: NSView {
     var pupLY: Int = 0
     var pupRX: Int = 0
     var pupRY: Int = 0
+    var noseX: Int = 0
+    var noseY: Int = 0
     var earL: Int = 0
     var earR: Int = 0
 
@@ -87,7 +123,6 @@ final class GazeOverlayView: NSView {
         ear: Int,
         title: String
     ) {
-        // Draw 32x16 4-bit grayscale eye crop cleanly via CGImage
         var pixels = [UInt8](repeating: 0, count: EYE_W * EYE_H)
         if crop.count == EYE_W * EYE_H {
             for i in 0..<(EYE_W * EYE_H) {
@@ -111,7 +146,6 @@ final class GazeOverlayView: NSView {
            ) {
             if let ctx = NSGraphicsContext.current?.cgContext {
                 ctx.saveGState()
-                // Unflip inside flipped view so the eye renders right-side up
                 ctx.translateBy(x: rect.minX, y: rect.maxY)
                 ctx.scaleBy(x: 1.0, y: -1.0)
                 ctx.draw(cgImg, in: CGRect(x: 0, y: 0, width: rect.width, height: rect.height))
@@ -119,7 +153,6 @@ final class GazeOverlayView: NSView {
             }
         }
 
-        // Green lock frame around eye
         let lockColor = eyeLocked
             ? NSColor(calibratedRed: 0.15, green: 0.96, blue: 0.55, alpha: 0.95)
             : NSColor(calibratedRed: 1.0, green: 0.35, blue: 0.25, alpha: 0.95)
@@ -128,7 +161,6 @@ final class GazeOverlayView: NSView {
         border.lineWidth = 2.0
         border.stroke()
 
-        // Crosshair at detected pupil offset
         let normX = 0.5 + CGFloat(pupX) / 256.0
         let normY = 0.5 + CGFloat(pupY) / 256.0
         let cx = rect.minX + max(0.1, min(0.9, normX)) * rect.width
@@ -155,12 +187,12 @@ final class GazeOverlayView: NSView {
     }
 
     private func drawEyeLockHUD(centerX: CGFloat, topY: CGFloat) {
-        let hudW: CGFloat = 286
-        let hudH: CGFloat = 96
+        let hudW: CGFloat = 336
+        let hudH: CGFloat = 104
         let hudRect = NSRect(x: centerX - hudW * 0.5, y: topY, width: hudW, height: hudH)
 
         let bg = NSBezierPath(roundedRect: hudRect, xRadius: 14, yRadius: 14)
-        NSColor(calibratedWhite: 0.05, alpha: 0.84).setFill()
+        NSColor(calibratedWhite: 0.05, alpha: 0.86).setFill()
         bg.fill()
 
         let borderColor = eyeLocked
@@ -171,24 +203,39 @@ final class GazeOverlayView: NSView {
         bg.stroke()
 
         let statusText = eyeLocked
-            ? "● HD КАМЕРА: ГЛАЗА ЗАФИКСИРОВАНЫ"
-            : "○ ПОИСК ГЛАЗ — СМОТРИТЕ В КАМЕРУ"
+            ? "● HD 720p: НОС (\(noseX),\(noseY)) + ГЛАЗА ЗАФИКСИРОВАНЫ"
+            : "○ ПОИСК ЛИЦА — СМОТРИТЕ В КАМЕРУ"
         let headerAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11.5, weight: .bold),
+            .font: NSFont.monospacedSystemFont(ofSize: 10.5, weight: .bold),
             .foregroundColor: borderColor,
         ]
         let hSize = (statusText as NSString).size(withAttributes: headerAttrs)
         (statusText as NSString).draw(
-            at: NSPoint(x: centerX - hSize.width * 0.5, y: topY + 7),
+            at: NSPoint(x: centerX - hSize.width * 0.5, y: topY + 8),
             withAttributes: headerAttrs
         )
 
-        let eyeW: CGFloat = 112
-        let eyeH: CGFloat = 54
-        let leftRect = NSRect(x: hudRect.minX + 20, y: topY + 26, width: eyeW, height: eyeH)
-        let rightRect = NSRect(x: hudRect.maxX - 20 - eyeW, y: topY + 26, width: eyeW, height: eyeH)
+        let eyeW: CGFloat = 116
+        let eyeH: CGFloat = 56
+        let leftRect = NSRect(x: hudRect.minX + 22, y: topY + 28, width: eyeW, height: eyeH)
+        let rightRect = NSRect(x: hudRect.maxX - 22 - eyeW, y: topY + 28, width: eyeW, height: eyeH)
         drawEyeCrop(rect: leftRect, crop: leftEyeU4, pupX: pupLX, pupY: pupLY, ear: earL, title: "L")
         drawEyeCrop(rect: rightRect, crop: rightEyeU4, pupX: pupRX, pupY: pupRY, ear: earR, title: "R")
+
+        // Tiny nose-pointer dot in center between the two eyes
+        let nBox = NSRect(x: centerX - 18, y: topY + 38, width: 36, height: 36)
+        let nBg = NSBezierPath(ovalIn: nBox)
+        NSColor(calibratedWhite: 0.16, alpha: 0.9).setFill()
+        nBg.fill()
+        NSColor(calibratedRed: 0.15, green: 0.88, blue: 1.0, alpha: 0.7).setStroke()
+        nBg.lineWidth = 1.2
+        nBg.stroke()
+
+        let nx = nBox.midX + max(-13, min(13, CGFloat(noseX) * 0.12))
+        let ny = nBox.midY + max(-13, min(13, CGFloat(noseY) * 0.12))
+        let nDot = NSBezierPath(ovalIn: NSRect(x: nx - 3.5, y: ny - 3.5, width: 7, height: 7))
+        NSColor(calibratedRed: 0.18, green: 1.0, blue: 0.65, alpha: 1.0).setFill()
+        nDot.fill()
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -199,23 +246,22 @@ final class GazeOverlayView: NSView {
         let h = bounds.height
 
         if mode == "intro" {
-            // Subtle dim backdrop so the start card is unmistakable
             NSColor(calibratedWhite: 0.02, alpha: 0.36).setFill()
             bounds.fill()
 
-            let cardW: CGFloat = 680
-            let cardH: CGFloat = 350
+            let cardW: CGFloat = 720
+            let cardH: CGFloat = 370
             let cardRect = NSRect(x: (w - cardW) * 0.5, y: (h - cardH) * 0.5, width: cardW, height: cardH)
             let card = NSBezierPath(roundedRect: cardRect, xRadius: 22, yRadius: 22)
-            NSColor(calibratedWhite: 0.06, alpha: 0.92).setFill()
+            NSColor(calibratedWhite: 0.06, alpha: 0.93).setFill()
             card.fill()
             NSColor(calibratedRed: 0.14, green: 0.92, blue: 1.0, alpha: 0.92).setStroke()
             card.lineWidth = 2.5
             card.stroke()
 
-            let titleStr = "TERNARA-GAZE • ЗАПУСК ТЕСТА КАЛИБРОВКИ" as NSString
+            let titleStr = "TERNARA-GAZE v4 • НОС + ГЛАЗА + ФИКСАЦИЯ ОБЛАСТИ" as NSString
             let titleAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 23, weight: .bold),
+                .font: NSFont.systemFont(ofSize: 22, weight: .bold),
                 .foregroundColor: NSColor(calibratedRed: 0.20, green: 0.96, blue: 1.0, alpha: 1.0),
             ]
             let tSize = titleStr.size(withAttributes: titleAttrs)
@@ -226,21 +272,20 @@ final class GazeOverlayView: NSView {
                 .foregroundColor: NSColor(white: 0.94, alpha: 0.96),
             ]
             let lines = [
-                "1. Смотрите на зелёную точку по углам экрана, пока кольцо заполняется",
-                "2. Когда кольцо станет ЗОЛОТЫМ — МОРГНИТЕ для перехода к следующей точке",
-                introSubtitle,
+                "1. Направляйте взгляд и слегка поворачивайте нос на зелёную точку",
+                "2. Когда кольцо станет ЗОЛОТЫМ — МОРГНИТЕ для перехода дальше",
+                "3. После теста курсор будет МАГНИТНО ФИКСИРОВАТЬСЯ на области без дрожания",
             ]
             for (idx, line) in lines.enumerated() {
                 let ns = line as NSString
                 let sz = ns.size(withAttributes: subAttrs)
                 ns.draw(
-                    at: NSPoint(x: w * 0.5 - sz.width * 0.5, y: cardRect.minY + 64 + CGFloat(idx) * 24),
+                    at: NSPoint(x: w * 0.5 - sz.width * 0.5, y: cardRect.minY + 62 + CGFloat(idx) * 24),
                     withAttributes: subAttrs
                 )
             }
 
-            // Live HD Eye-Lock preview right inside the start card
-            drawEyeLockHUD(centerX: w * 0.5, topY: cardRect.minY + 148)
+            drawEyeLockHUD(centerX: w * 0.5, topY: cardRect.minY + 152)
 
             let cdStr = "Старт через: \(introStep)" as NSString
             let cdAttrs: [NSAttributedString.Key: Any] = [
@@ -261,18 +306,13 @@ final class GazeOverlayView: NSView {
             let isBlinkWait = (calState == "BLINK")
             let pulse = 1.0 + 0.10 * sin(pulsePhase)
 
-            // Position banner + eye HUD away from top targets so nothing overlaps!
             let hudNearBottom = (targetY < 0.30)
-            let bannerY: CGFloat = hudNearBottom ? (h - 196) : 34
-            let hudY: CGFloat = hudNearBottom ? (h - 134) : 96
+            let bannerY: CGFloat = hudNearBottom ? (h - 204) : 34
+            let hudY: CGFloat = hudNearBottom ? (h - 142) : 96
 
-            // Banner pill
-            let mainText: String
-            if isBlinkWait {
-                mainText = "\(calLabel)  •  МОРГНИ ДЛЯ ПЕРЕХОДА!"
-            } else {
-                mainText = "\(calLabel)  •  СМОТРИ НА ТОЧКУ (\(Int(calPct * 100))%)"
-            }
+            let mainText = isBlinkWait
+                ? "\(calLabel)  •  МОРГНИ ДЛЯ ПЕРЕХОДА!"
+                : "\(calLabel)  •  СМОТРИ + НАПРАВЬ НОС (\(Int(calPct * 100))%)"
             let pillAttrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 18, weight: .bold),
                 .foregroundColor: isBlinkWait
@@ -281,12 +321,7 @@ final class GazeOverlayView: NSView {
             ]
             let txt = mainText as NSString
             let sz = txt.size(withAttributes: pillAttrs)
-            let pillRect = NSRect(
-                x: (w - sz.width) * 0.5 - 24,
-                y: bannerY,
-                width: sz.width + 48,
-                height: 46
-            )
+            let pillRect = NSRect(x: (w - sz.width) * 0.5 - 24, y: bannerY, width: sz.width + 48, height: 46)
             let pill = NSBezierPath(roundedRect: pillRect, xRadius: 23, yRadius: 23)
             NSColor(calibratedWhite: 0.05, alpha: 0.86).setFill()
             pill.fill()
@@ -298,10 +333,8 @@ final class GazeOverlayView: NSView {
             pill.stroke()
             txt.draw(at: NSPoint(x: pillRect.minX + 24, y: pillRect.minY + 11), withAttributes: pillAttrs)
 
-            // Live Eye-Lock HUD so user confirms MacBook camera stays locked on eyes
             drawEyeLockHUD(centerX: w * 0.5, topY: hudY)
 
-            // Calibration target circle
             let outerR: CGFloat = (isBlinkWait ? 38.0 * pulse : 34.0)
             let outer = NSBezierPath(ovalIn: NSRect(x: px - outerR, y: py - outerR, width: outerR * 2, height: outerR * 2))
             if isBlinkWait {
@@ -336,13 +369,11 @@ final class GazeOverlayView: NSView {
                 arc.stroke()
             }
 
-            // Crisp center fixation point
             let innerR: CGFloat = 6.5
             let inner = NSBezierPath(ovalIn: NSRect(x: px - innerR, y: py - innerR, width: innerR * 2, height: innerR * 2))
             (isBlinkWait ? NSColor(calibratedRed: 1.0, green: 0.90, blue: 0.25, alpha: 1.0) : NSColor.white).setFill()
             inner.fill()
 
-            // Local label right next to dot when waiting for blink
             if isBlinkWait {
                 let hint = "МОРГНИ!" as NSString
                 let hAttrs: [NSAttributedString.Key: Any] = [
@@ -357,28 +388,61 @@ final class GazeOverlayView: NSView {
             return
         }
 
-        // Floating second virtual cursor mode (never hijacks physical mouse!)
-        let px = renderX * w
-        let py = renderY * h
+        // FLOATING SECOND CURSOR + MAGNETIC REGION LOCK MODE
+        let b = screenBounds()
+        let px: CGFloat
+        let py: CGFloat
+        if regionLocked, let sr = snappedRect {
+            // Draw glowing VisionOS-style focus border around the locked macOS UI element!
+            let localRect = NSRect(
+                x: sr.origin.x - b.origin.x - 4,
+                y: sr.origin.y - b.origin.y - 4,
+                width: sr.size.width + 8,
+                height: sr.size.height + 8
+            )
+            let focusBox = NSBezierPath(roundedRect: localRect, xRadius: 10, yRadius: 10)
+            NSColor(calibratedRed: 0.14, green: 0.96, blue: 0.64, alpha: 0.12).setFill()
+            focusBox.fill()
+            NSColor(calibratedRed: 0.18, green: 0.98, blue: 0.68, alpha: 0.92).setStroke()
+            focusBox.lineWidth = 2.6
+            focusBox.stroke()
 
-        // Compact top-right eye-lock status badge (non-intrusive)
-        let badgeStr = (eyeLocked ? "● EYE LOCK HD" : "○ EYE LOST") as NSString
-        let badgeColor = eyeLocked
-            ? NSColor(calibratedRed: 0.16, green: 0.96, blue: 0.56, alpha: 0.95)
-            : NSColor(calibratedRed: 1.0, green: 0.40, blue: 0.25, alpha: 0.95)
+            px = localRect.midX
+            py = localRect.midY
+        } else {
+            px = renderX * w
+            py = renderY * h
+        }
+
+        // Compact top-right status badge
+        let badgeText: String
+        let badgeColor: NSColor
+        if !eyeLocked {
+            badgeText = "○ NO FACE"
+            badgeColor = NSColor(calibratedRed: 1.0, green: 0.40, blue: 0.25, alpha: 0.95)
+        } else if regionLocked && snappedRect != nil {
+            badgeText = "● TARGET LOCKED"
+            badgeColor = NSColor(calibratedRed: 0.18, green: 1.0, blue: 0.65, alpha: 0.98)
+        } else if regionLocked {
+            badgeText = "● ZONE LOCKED"
+            badgeColor = NSColor(calibratedRed: 0.16, green: 0.96, blue: 0.62, alpha: 0.95)
+        } else {
+            badgeText = "◎ TRACKING (NOSE+EYE)"
+            badgeColor = NSColor(calibratedRed: 0.15, green: 0.88, blue: 1.0, alpha: 0.95)
+        }
         let bAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .bold),
             .foregroundColor: badgeColor,
         ]
-        let bSz = badgeStr.size(withAttributes: bAttrs)
+        let bSz = (badgeText as NSString).size(withAttributes: bAttrs)
         let bRect = NSRect(x: w - bSz.width - 34, y: 34, width: bSz.width + 20, height: 24)
         let bPath = NSBezierPath(roundedRect: bRect, xRadius: 12, yRadius: 12)
-        NSColor(calibratedWhite: 0.05, alpha: 0.72).setFill()
+        NSColor(calibratedWhite: 0.05, alpha: 0.76).setFill()
         bPath.fill()
-        badgeColor.withAlphaComponent(0.75).setStroke()
-        bPath.lineWidth = 1.2
+        badgeColor.withAlphaComponent(0.8).setStroke()
+        bPath.lineWidth = 1.3
         bPath.stroke()
-        badgeStr.draw(at: NSPoint(x: bRect.minX + 10, y: bRect.minY + 4), withAttributes: bAttrs)
+        (badgeText as NSString).draw(at: NSPoint(x: bRect.minX + 10, y: bRect.minY + 4), withAttributes: bAttrs)
 
         // Click flash ripple
         if clickFlash > 0.02 {
@@ -392,20 +456,22 @@ final class GazeOverlayView: NSView {
             ripple.stroke()
         }
 
-        // Soft glowing aura
-        let auraR: CGFloat = 22.0
+        // Reticle (turns crisp emerald-cyan when locked on a region, glowing cyan when gliding)
+        let mainColor = regionLocked
+            ? NSColor(calibratedRed: 0.18, green: 0.98, blue: 0.66, alpha: 0.96)
+            : NSColor(calibratedRed: 0.15, green: 0.88, blue: 1.0, alpha: 0.90)
+
+        let auraR: CGFloat = regionLocked ? 20.0 : 23.0
         let aura = NSBezierPath(ovalIn: NSRect(x: px - auraR, y: py - auraR, width: auraR * 2, height: auraR * 2))
-        NSColor(calibratedRed: 0.12, green: 0.84, blue: 1.0, alpha: 0.14).setFill()
+        mainColor.withAlphaComponent(regionLocked ? 0.18 : 0.12).setFill()
         aura.fill()
 
-        // Main smooth cyan ring
-        let baseR: CGFloat = 14.0
+        let baseR: CGFloat = regionLocked ? 12.5 : 14.5
         let ring = NSBezierPath(ovalIn: NSRect(x: px - baseR, y: py - baseR, width: baseR * 2, height: baseR * 2))
-        NSColor(calibratedRed: 0.15, green: 0.88, blue: 1.0, alpha: 0.92).setStroke()
-        ring.lineWidth = 2.6
+        mainColor.setStroke()
+        ring.lineWidth = regionLocked ? 3.0 : 2.4
         ring.stroke()
 
-        // Deliberate blink-click progress arc
         if holdPct > 0.02 {
             let arc = NSBezierPath()
             arc.appendArc(
@@ -415,13 +481,12 @@ final class GazeOverlayView: NSView {
                 endAngle: 90 - 360 * min(1.0, holdPct),
                 clockwise: true
             )
-            NSColor(calibratedRed: 0.20, green: 1.0, blue: 0.60, alpha: 0.98).setStroke()
-            arc.lineWidth = 4.0
+            NSColor(calibratedRed: 1.0, green: 0.88, blue: 0.20, alpha: 0.98).setStroke()
+            arc.lineWidth = 4.2
             arc.lineCapStyle = .round
             arc.stroke()
         }
 
-        // Crisp center dot
         let dotR: CGFloat = 3.5
         let dot = NSBezierPath(ovalIn: NSRect(x: px - dotR, y: py - dotR, width: dotR * 2, height: dotR * 2))
         NSColor.white.setFill()
@@ -433,6 +498,9 @@ final class OverlayController {
     let window: NSWindow
     let view: GazeOverlayView
     private var timer: Timer?
+    private var lastLockedX: Int = -1
+    private var lastLockedY: Int = -1
+    private var cachedSnapPoint: CGPoint? = nil
 
     init() {
         let frame = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
@@ -455,8 +523,7 @@ final class OverlayController {
 
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            // Critically-damped smooth 60 FPS glide (zero micro-jitter!)
-            let lerp: CGFloat = 0.14
+            let lerp: CGFloat = self.view.regionLocked ? 0.20 : 0.14
             self.view.renderX += (self.view.targetX - self.view.renderX) * lerp
             self.view.renderY += (self.view.targetY - self.view.renderY) * lerp
             self.view.pulsePhase += 0.16
@@ -477,6 +544,8 @@ final class OverlayController {
         pupLY: Int,
         pupRX: Int,
         pupRY: Int,
+        noseX: Int,
+        noseY: Int,
         earL: Int,
         earR: Int
     ) {
@@ -489,6 +558,8 @@ final class OverlayController {
                 self.view.pupLY = pupLY
                 self.view.pupRX = pupRX
                 self.view.pupRY = pupRY
+                self.view.noseX = noseX
+                self.view.noseY = noseY
                 self.view.earL = earL
                 self.view.earR = earR
             }
@@ -505,13 +576,49 @@ final class OverlayController {
         }
     }
 
-    func updateGaze(xU16: Int, yU16: Int, holdPct: Int) {
+    func updateGaze(xU16: Int, yU16: Int, holdPct: Int, locked: Bool) {
+        let clampedX = max(0, min(65535, xU16))
+        let clampedY = max(0, min(65535, yU16))
+        var snapRect: CGRect? = nil
+        var snapPt: CGPoint? = nil
+
+        if locked {
+            if abs(clampedX - lastLockedX) > 250 || abs(clampedY - lastLockedY) > 250 || cachedSnapPoint == nil {
+                lastLockedX = clampedX
+                lastLockedY = clampedY
+                let pt = u16ToScreenPoint(xU16: clampedX, yU16: clampedY)
+                if let r = queryMagneticTargetRect(screenPt: pt) {
+                    snapRect = r
+                    snapPt = CGPoint(x: r.midX, y: r.midY)
+                }
+                cachedSnapPoint = snapPt
+                DispatchQueue.main.async {
+                    self.view.snappedRect = snapRect
+                }
+            }
+        } else {
+            lastLockedX = -1
+            lastLockedY = -1
+            cachedSnapPoint = nil
+            DispatchQueue.main.async {
+                self.view.snappedRect = nil
+            }
+        }
+
         DispatchQueue.main.async {
             self.view.mode = "gaze"
-            self.view.targetX = CGFloat(max(0, min(65535, xU16))) / 65535.0
-            self.view.targetY = CGFloat(max(0, min(65535, yU16))) / 65535.0
+            self.view.regionLocked = locked
+            self.view.targetX = CGFloat(clampedX) / 65535.0
+            self.view.targetY = CGFloat(clampedY) / 65535.0
             self.view.holdPct = CGFloat(max(0, min(100, holdPct))) / 100.0
         }
+    }
+
+    func clickPointFor(xU16: Int, yU16: Int) -> CGPoint {
+        if let sp = cachedSnapPoint {
+            return sp
+        }
+        return u16ToScreenPoint(xU16: xU16, yU16: yU16)
     }
 
     func updateCalTarget(xU16: Int, yU16: Int, pct: Int, state: String, label: String) {
@@ -535,7 +642,7 @@ final class OverlayController {
     }
 }
 
-// MARK: - Rigid HD Eye ROI, Sub-Pixel Pupil Geometry, EAR & 3D Head Pose
+// MARK: - Rigid HD Eye ROI, Sub-Pixel Pupil Geometry, EAR & 3D Nose Pointer
 
 func cropEyeU4(
     yBase: UnsafePointer<UInt8>,
@@ -580,7 +687,6 @@ func eyeBoxInImage(faceBox: CGRect, region: VNFaceLandmarkRegion2D) -> CGRect {
     let w = max(0.02, maxX - minX)
     let cx = (minX + maxX) * 0.5
     let cy = (minY + maxY) * 0.5
-    // Keep crop aspect ratio fixed to rigid eye width so blinking never zooms the ROI!
     let boxW = w * 1.55
     let boxH = boxW * 0.52
     return CGRect(x: cx - boxW * 0.5, y: cy - boxH * 0.5, width: boxW, height: boxH)
@@ -589,11 +695,10 @@ func eyeBoxInImage(faceBox: CGRect, region: VNFaceLandmarkRegion2D) -> CGRect {
 func rigidEyePupilAndEAR(
     eye: VNFaceLandmarkRegion2D,
     pupil: VNFaceLandmarkRegion2D?
-) -> (px: Int, py: Int, ear: Int, center: CGPoint, width: CGFloat) {
+) -> (px: Double, py: Double, ear: Int, center: CGPoint, width: CGFloat) {
     let pts = eye.normalizedPoints
     guard !pts.isEmpty else { return (0, 0, 0, CGPoint(x: 0.5, y: 0.5), 0.1) }
 
-    // Find rigid inner & outer canthus corners (minX and maxX points)
     var leftCorner = pts[0]
     var rightCorner = pts[0]
     var minY: CGFloat = 1.0
@@ -609,7 +714,6 @@ func rigidEyePupilAndEAR(
     let h = max(0.001, maxY - minY)
     let ear = max(0, min(500, Int((h / w) * 1000.0)))
 
-    // Rigid anchor midpoint on the bony eye-corner line (does NOT bounce when eyelids squint!)
     let cornerMidX = (leftCorner.x + rightCorner.x) * 0.5
     let cornerMidY = (leftCorner.y + rightCorner.y) * 0.5
     let center = CGPoint(x: cornerMidX, y: cornerMidY)
@@ -617,41 +721,43 @@ func rigidEyePupilAndEAR(
     guard let p = pupil?.normalizedPoints.first else {
         return (0, 0, ear, center, w)
     }
-    // Divide BOTH X and Y by rigid eye width `w` (fixes vertical eyelid-height jitter!)
     let relX = -Double((p.x - cornerMidX) / w) * 320.0
     let relY = -Double((p.y - cornerMidY) / w) * 520.0
-    let px = max(-128, min(127, Int(relX)))
-    let py = max(-128, min(127, Int(relY)))
-    return (px, py, ear, center, w)
+    return (relX, relY, ear, center, w)
 }
 
-func landmarkYawPitch(
+func noseTipAndPose(
+    faceBox: CGRect,
     leftEyeCenter: CGPoint,
     rightEyeCenter: CGPoint,
-    nose: VNFaceLandmarkRegion2D?
-) -> (Int, Int) {
+    nose: VNFaceLandmarkRegion2D?,
+    noseCrest: VNFaceLandmarkRegion2D?
+) -> (noseX: Double, noseY: Double, yaw: Double, pitch: Double) {
     let eyeMidX = (leftEyeCenter.x + rightEyeCenter.x) * 0.5
     let eyeMidY = (leftEyeCenter.y + rightEyeCenter.y) * 0.5
     let iod = max(0.05, abs(rightEyeCenter.x - leftEyeCenter.x))
-    guard let nPts = nose?.normalizedPoints, !nPts.isEmpty else { return (0, 0) }
-    var nx: CGFloat = 0.0
-    var ny: CGFloat = 0.0
-    for p in nPts {
-        nx += p.x
-        ny += p.y
-    }
-    nx /= CGFloat(nPts.count)
-    ny /= CGFloat(nPts.count)
 
-    // Horizontal nose offset from eye midpoint -> head yaw (mirrored)
-    let yawVal = -Double((nx - eyeMidX) / iod) * 360.0
-    // Vertical nose drop below eye line -> head pitch (neutral ~0.42*IOD)
-    let pitchRatio = Double((eyeMidY - ny) / iod) - 0.42
-    let pitchVal = pitchRatio * 340.0
-    return (
-        max(-128, min(127, Int(yawVal))),
-        max(-128, min(127, Int(pitchVal)))
-    )
+    // Use bottom-most point of noseCrest (the true 3D nose tip!) or centroid of nose
+    var tipLocal = CGPoint(x: eyeMidX, y: eyeMidY - 0.35 * iod)
+    if let crest = noseCrest?.normalizedPoints, let last = crest.last {
+        tipLocal = last
+    } else if let nPts = nose?.normalizedPoints, !nPts.isEmpty {
+        var nx: CGFloat = 0.0
+        var ny: CGFloat = 0.0
+        for p in nPts { nx += p.x; ny += p.y }
+        tipLocal = CGPoint(x: nx / CGFloat(nPts.count), y: ny / CGFloat(nPts.count))
+    }
+
+    // Full image-space nose tip coordinate (rigid skull pointer!)
+    let imgX = Double(faceBox.origin.x + tipLocal.x * faceBox.size.width)
+    let imgY = 1.0 - Double(faceBox.origin.y + tipLocal.y * faceBox.size.height)
+    let noseX = (0.5 - imgX) * 512.0   // mirrored so pointing right is positive
+    let noseY = (imgY - 0.5) * 512.0   // pointing down is positive
+
+    // 3D nose-tip vector relative to inter-ocular midpoint (pure head rotation!)
+    let yaw = -Double((tipLocal.x - eyeMidX) / iod) * 380.0
+    let pitch = (Double((eyeMidY - tipLocal.y) / iod) - 0.42) * 380.0
+    return (noseX, noseY, yaw, pitch)
 }
 
 func packNibblesHex(left: [UInt8], right: [UInt8]) -> String {
@@ -677,9 +783,18 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
     let diagMode: Bool
     weak var overlay: OverlayController?
 
+    // Gentle pre-EMA on raw landmarks to kill 1-frame Vision quantization noise before Python
+    private var hasEma = false
+    private var sNoseX = 0.0, sNoseY = 0.0, sYaw = 0.0, sPitch = 0.0
+    private var sPupLX = 0.0, sPupLY = 0.0, sPupRX = 0.0, sPupRY = 0.0
+
     init(diagMode: Bool, overlay: OverlayController?) {
         self.diagMode = diagMode
         self.overlay = overlay
+    }
+
+    private func clampI8(_ v: Double) -> Int {
+        return max(-128, min(127, Int(v.rounded())))
     }
 
     func captureOutput(
@@ -703,7 +818,7 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
               let rightEye = lm.rightEye else {
             overlay?.updateEyeLock(
                 locked: false, leftU4: [], rightU4: [],
-                pupLX: 0, pupLY: 0, pupRX: 0, pupRY: 0, earL: 0, earR: 0
+                pupLX: 0, pupLY: 0, pupRX: 0, pupRY: 0, noseX: 0, noseY: 0, earL: 0, earR: 0
             )
             return
         }
@@ -712,11 +827,41 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let rightBox = eyeBoxInImage(faceBox: face.boundingBox, region: rightEye)
         let lGeom = rigidEyePupilAndEAR(eye: leftEye, pupil: lm.leftPupil)
         let rGeom = rigidEyePupilAndEAR(eye: rightEye, pupil: lm.rightPupil)
-        let (yawInt, pitchInt) = landmarkYawPitch(
+        let nPose = noseTipAndPose(
+            faceBox: face.boundingBox,
             leftEyeCenter: lGeom.center,
             rightEyeCenter: rGeom.center,
-            nose: lm.nose ?? lm.noseCrest
+            nose: lm.nose,
+            noseCrest: lm.noseCrest
         )
+
+        if !hasEma {
+            sNoseX = nPose.noseX; sNoseY = nPose.noseY
+            sYaw = nPose.yaw; sPitch = nPose.pitch
+            sPupLX = lGeom.px; sPupLY = lGeom.py
+            sPupRX = rGeom.px; sPupRY = rGeom.py
+            hasEma = true
+        } else {
+            let aNose = 0.45  // crisp nose tracking with zero micro-chatter
+            let aPup = 0.35   // calmer pupil refinement
+            sNoseX += (nPose.noseX - sNoseX) * aNose
+            sNoseY += (nPose.noseY - sNoseY) * aNose
+            sYaw += (nPose.yaw - sYaw) * aNose
+            sPitch += (nPose.pitch - sPitch) * aNose
+            sPupLX += (lGeom.px - sPupLX) * aPup
+            sPupLY += (lGeom.py - sPupLY) * aPup
+            sPupRX += (rGeom.px - sPupRX) * aPup
+            sPupRY += (rGeom.py - sPupRY) * aPup
+        }
+
+        let noseXInt = clampI8(sNoseX)
+        let noseYInt = clampI8(sNoseY)
+        let yawInt = clampI8(sYaw)
+        let pitchInt = clampI8(sPitch)
+        let pupLXInt = clampI8(sPupLX)
+        let pupLYInt = clampI8(sPupLY)
+        let pupRXInt = clampI8(sPupRX)
+        let pupRYInt = clampI8(sPupRY)
 
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
@@ -735,24 +880,22 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
             locked: true,
             leftU4: leftU4,
             rightU4: rightU4,
-            pupLX: lGeom.px,
-            pupLY: lGeom.py,
-            pupRX: rGeom.px,
-            pupRY: rGeom.py,
+            pupLX: pupLXInt,
+            pupLY: pupLYInt,
+            pupRX: pupRXInt,
+            pupRY: pupRYInt,
+            noseX: noseXInt,
+            noseY: noseYInt,
             earL: lGeom.ear,
             earR: rGeom.ear
         )
-
-        let faceCx = Double(face.boundingBox.midX)
-        let faceCy = 1.0 - Double(face.boundingBox.midY)
-        let headX = max(-128, min(127, Int((0.5 - faceCx) * 256.0)))
-        let headY = max(-128, min(127, Int((faceCy - 0.5) * 256.0)))
 
         let nowMs = Int((DispatchTime.now().uptimeNanoseconds - startTime) / 1_000_000)
         let (mx, my) = currentMouseU16()
         eyeFrames += 1
 
-        let line = "{\"seq\":\(eyeFrames),\"ts_ms\":\(nowMs),\"head_x\":\(headX),\"head_y\":\(headY),\"yaw\":\(yawInt),\"pitch\":\(pitchInt),\"pup_lx\":\(lGeom.px),\"pup_ly\":\(lGeom.py),\"pup_rx\":\(rGeom.px),\"pup_ry\":\(rGeom.py),\"ear_l\":\(lGeom.ear),\"ear_r\":\(rGeom.ear),\"mx_u16\":\(mx),\"my_u16\":\(my),\"eyes_hex\":\"\(hexStr)\"}\n"
+        // Emit nose_x/nose_y (also aliased to head_x/head_y for clean backwards compatibility)
+        let line = "{\"seq\":\(eyeFrames),\"ts_ms\":\(nowMs),\"head_x\":\(noseXInt),\"head_y\":\(noseYInt),\"nose_x\":\(noseXInt),\"nose_y\":\(noseYInt),\"yaw\":\(yawInt),\"pitch\":\(pitchInt),\"pup_lx\":\(pupLXInt),\"pup_ly\":\(pupLYInt),\"pup_rx\":\(pupRXInt),\"pup_ry\":\(pupRYInt),\"ear_l\":\(lGeom.ear),\"ear_r\":\(rGeom.ear),\"mx_u16\":\(mx),\"my_u16\":\(my),\"eyes_hex\":\"\(hexStr)\"}\n"
         if let data = line.data(using: .utf8) {
             FileHandle.standardOutput.write(data)
         }
@@ -766,7 +909,7 @@ if args.contains("--self-test") {
     let b = screenBounds()
     let ax = AXIsProcessTrusted()
     let camAuth = AVCaptureDevice.authorizationStatus(for: .video).rawValue
-    print("{\"status\":\"ok\",\"screen_w\":\(Int(b.width)),\"screen_h\":\(Int(b.height)),\"camera_mode\":\"hd1280x720\",\"eye_roi\":\"32x16x4bit\",\"overlay\":\"virtual_second_cursor_v3_eyelock\",\"accessibility_trusted\":\(ax),\"camera_auth\":\(camAuth)}")
+    print("{\"status\":\"ok\",\"screen_w\":\(Int(b.width)),\"screen_h\":\(Int(b.height)),\"camera_mode\":\"hd1280x720\",\"eye_roi\":\"32x16x4bit\",\"overlay\":\"virtual_second_cursor_v4_nose_region_lock\",\"accessibility_trusted\":\(ax),\"camera_auth\":\(camAuth)}")
     exit(0)
 }
 
@@ -790,20 +933,21 @@ if overlayEnabled {
                 overlay?.updateIntro(step: step, subtitle: sub)
             } else if cmd == "G", parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]) {
                 let pct = parts.count >= 4 ? (Int(parts[3]) ?? 0) : 0
-                overlay?.updateGaze(xU16: x, yU16: y, holdPct: pct)
+                let locked = parts.count >= 5 ? ((Int(parts[4]) ?? 0) != 0) : false
+                overlay?.updateGaze(xU16: x, yU16: y, holdPct: pct, locked: locked)
             } else if cmd == "T", parts.count >= 5, let x = Int(parts[1]), let y = Int(parts[2]), let pct = Int(parts[3]) {
                 let state = String(parts[4])
                 let lbl = parts.count >= 6 ? String(parts[5]) : ""
                 overlay?.updateCalTarget(xU16: x, yU16: y, pct: pct, state: state, label: lbl)
             } else if cmd == "L", parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]) {
                 overlay?.triggerClickFlash(right: false)
-                if clicksEnabled {
-                    atomicClickAtU16(xU16: x, yU16: y, right: false)
+                if clicksEnabled, let pt = overlay?.clickPointFor(xU16: x, yU16: y) {
+                    atomicClickAtPoint(target: pt, right: false)
                 }
             } else if cmd == "R", parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]) {
                 overlay?.triggerClickFlash(right: true)
-                if clicksEnabled {
-                    atomicClickAtU16(xU16: x, yU16: y, right: true)
+                if clicksEnabled, let pt = overlay?.clickPointFor(xU16: x, yU16: y) {
+                    atomicClickAtPoint(target: pt, right: true)
                 }
             } else if cmd == "Q" {
                 exit(0)

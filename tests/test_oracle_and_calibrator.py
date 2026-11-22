@@ -173,3 +173,32 @@ def test_fixation_lock_eliminates_micro_tremor_and_ear_click():
     assert d_cl.frozen is True
     d_op = ctrl.step(30000, 30000, -50, -50, now_ms=1320, ear_l=280, ear_r=280)
     assert d_op.click == "left_click"
+
+
+def test_sustained_intent_region_lock_rejects_glitches_and_relocks():
+    ctrl = GazeCursorController(FilterConfig())
+    d0 = ctrl.step(20000, 20000, -50, -50, now_ms=0)
+    assert d0.locked is True
+    assert (d0.x_u16, d0.y_u16) == (20000, 20000)
+
+    # Brief 3-frame glitch far away MUST NOT break the region lock!
+    for i in range(1, 4):
+        d = ctrl.step(48000, 48000, -50, -50, now_ms=i * 33)
+        assert d.locked is True
+        assert (d.x_u16, d.y_u16) == (20000, 20000)
+
+    # Sustained intentional gaze move to (50000, 45000) unlocks, glides, and re-locks!
+    unlocked_seen = False
+    relocked_seen = False
+    for i in range(4, 45):
+        d = ctrl.step(50000, 45000, -50, -50, now_ms=i * 33)
+        if not d.locked:
+            unlocked_seen = True
+        if unlocked_seen and d.locked:
+            relocked_seen = True
+            break
+
+    assert unlocked_seen is True
+    assert relocked_seen is True
+    assert abs(d.x_u16 - 50000) < 2000
+    assert abs(d.y_u16 - 45000) < 2000

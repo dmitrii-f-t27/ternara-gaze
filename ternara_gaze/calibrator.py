@@ -1,24 +1,24 @@
-"""Pure-integer Q12 corner-first polynomial gaze calibrator (on-chip compatible, zero overfitting).
+"""Pure-integer Q12 Nose-Anchored + Eye-Refined corner-first gaze calibrator (0 floats at inference).
 
-Uses 14 physically orthogonal integer features instead of high-dimensional raw hidden activations:
-  [0..3]   pupil relative offsets (pup_lx, pup_ly, pup_rx, pup_ry) in [-128..+127]
-  [4..5]   Q27 0-DSP ternary backbone raw (gaze_x, gaze_y)
-  [6..7]   head position anchor (head_x, head_y) in [-128..+127]
-  [8..9]   head orientation (yaw, pitch) in [-128..+127]
-  [10..12] mild quadratic interaction terms: (px_avg^2>>7, py_avg^2>>7, (px_avg*py_avg)>>7)
+Uses 14 physically orthogonal integer features ordered by signal-to-noise ratio (SNR):
+  [0..1]   HD nose-tip pointer (nose_x, nose_y) in [-128..+127]       -- PRIMARY ultra-low-noise backbone
+  [2..3]   3D nose-to-eye orientation (yaw, pitch) in [-128..+127]    -- PRIMARY head rotation backbone
+  [4..5]   averaged rigid pupils ((pup_lx+pup_rx)//2, (pup_ly+pup_ry)//2) -- bounded fine eye refinement
+  [6..7]   Q27 0-DSP ternary backbone raw (gaze_x, gaze_y)            -- bounded fine eye refinement
+  [8..9]   pupil vergence/asymmetry ((pup_lx-pup_rx)//2, (pup_ly-pup_ry)//2)
+  [10..12] mild quadratic terms of the clean nose+yaw/pitch signal
   [13]     constant bias = 64
 
-Fitted over 13 corner-first calibration targets (4 true extreme corners FIRST, then center,
-4 edge midpoints, and 4 inner quadrants) with per-target robust median/MAD outlier rejection.
-At inference time: 100% pure integer dot product + `>> 12` shift (0 floats).
+Tiered ridge regularization ensures the rock-solid nose pointer carries the coarse screen zone
+without ever amplifying webcam pupil noise into cursor wander.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
 from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -26,8 +26,6 @@ Q_SHIFT = 12
 Q_SCALE = 1 << Q_SHIFT  # 4096
 CAL_FEAT_DIM = 14
 
-# 13-point corner-first calibration grid:
-# 4 TRUE extreme corners first, then center, 4 edge midpoints, 4 inner quadrants
 CORNER_FIRST_GRID: Tuple[Tuple[float, float, str], ...] = (
     (0.04, 0.05, "1/13  TOP-LEFT CORNER"),
     (0.96, 0.05, "2/13  TOP-RIGHT CORNER"),
@@ -44,27 +42,23 @@ CORNER_FIRST_GRID: Tuple[Tuple[float, float, str], ...] = (
     (0.26, 0.72, "13/13 LOWER-LEFT"),
 )
 
-# Backwards-compatible alias
 NINE_POINT_GRID_NORM: Tuple[Tuple[float, float], ...] = tuple((x, y) for x, y, _ in CORNER_FIRST_GRID[:9])
 
 
 def dark_pupil_centroid_int(crop_u4: np.ndarray) -> Tuple[int, int]:
     """Pure-integer dark-pupil centroid inside a (16, 32) 4-bit eye crop -> (px, py) in [-128, +127]."""
     c = np.asarray(crop_u4, dtype=np.int32)
-    # Focus on central eye aperture (avoid outer brow/eyelash frame)
     roi = c[3:13, 5:27]  # 10 x 22
     max_v = int(roi.max())
     min_v = int(roi.min())
     thresh = min_v + max(1, (max_v - min_v) >> 2)
-    # Weight darker pixels linearly: w = max(0, thresh - pixel + 1)
     weights = np.maximum(0, thresh - roi + 1)
     total_w = int(weights.sum())
     if total_w <= 0:
         return 0, 0
     yy, xx = np.mgrid[0:10, 0:22]
-    cx_q8 = (int((weights * xx).sum()) << 8) // total_w  # [0..21*256]
-    cy_q8 = (int((weights * yy).sum()) << 8) // total_w  # [0..9*256]
-    # Center around midpoint (10.5, 4.5) and scale to [-128, +127]
+    cx_q8 = (int((weights * xx).sum()) << 8) // total_w
+    cy_q8 = (int((weights * yy).sum()) << 8) // total_w
     px = max(-128, min(127, ((cx_q8 - 2688) * 12) >> 8))
     py = max(-128, min(127, ((cy_q8 - 1152) * 26) >> 8))
     return int(px), int(py)
@@ -83,25 +77,33 @@ def build_cal_feature(
     yaw: int = 0,
     pitch: int = 0,
 ) -> np.ndarray:
-    """Assemble the 14-element physically orthogonal int32 calibration feature vector."""
-    del h2  # intentionally excluded to avoid 37-dim overfitting on small calibration grids
-    px_avg = (int(pup_lx) + int(pup_rx) + int(yaw)) // 2
-    py_avg = (int(pup_ly) + int(pup_ry) + int(pitch)) // 2
-    q_xx = max(-128, min(127, (px_avg * px_avg) >> 7))
-    q_yy = max(-128, min(127, (py_avg * py_avg) >> 7))
-    q_xy = max(-128, min(127, (px_avg * py_avg) >> 7))
+    """Assemble the 14-element SNR-ordered int32 calibration feature vector (nose-first + eye-refined)."""
+    del h2
+    nose_x = int(head_x)
+    nose_y = int(head_y)
+    pup_avg_x = (int(pup_lx) + int(pup_rx)) >> 1
+    pup_avg_y = (int(pup_ly) + int(pup_ry)) >> 1
+    pup_diff_x = (int(pup_lx) - int(pup_rx)) >> 1
+    pup_diff_y = (int(pup_ly) - int(pup_ry)) >> 1
+
+    # Clean quadratic interaction on the low-noise nose+orientation signal
+    ax = (nose_x + int(yaw)) >> 1
+    ay = (nose_y + int(pitch)) >> 1
+    q_xx = max(-128, min(127, (ax * ax) >> 7))
+    q_yy = max(-128, min(127, (ay * ay) >> 7))
+    q_xy = max(-128, min(127, (ax * ay) >> 7))
     return np.array(
         [
-            int(pup_lx),
-            int(pup_ly),
-            int(pup_rx),
-            int(pup_ry),
-            int(gaze_x),
-            int(gaze_y),
-            int(head_x),
-            int(head_y),
+            nose_x,
+            nose_y,
             int(yaw),
             int(pitch),
+            pup_avg_x,
+            pup_avg_y,
+            int(gaze_x),
+            int(gaze_y),
+            pup_diff_x,
+            pup_diff_y,
             q_xx,
             q_yy,
             q_xy,
@@ -144,15 +146,13 @@ class IntegerGazeCalibrator:
     def identity_default(cls) -> "IntegerGazeCalibrator":
         wx = np.zeros(CAL_FEAT_DIM, dtype=np.int32)
         wy = np.zeros(CAL_FEAT_DIM, dtype=np.int32)
-        wx[0] = 180 << Q_SHIFT   # pup_lx
-        wx[2] = 180 << Q_SHIFT   # pup_rx
-        wx[4] = 96 << Q_SHIFT    # q27 gaze_x
-        wx[8] = 220 << Q_SHIFT   # yaw
+        wx[0] = 260 << Q_SHIFT   # nose_x
+        wx[2] = 240 << Q_SHIFT   # yaw
+        wx[4] = 120 << Q_SHIFT   # pup_avg_x
         wx[13] = 512 << Q_SHIFT  # center
-        wy[1] = 180 << Q_SHIFT   # pup_ly
-        wy[3] = 180 << Q_SHIFT   # pup_ry
-        wy[5] = 96 << Q_SHIFT    # q27 gaze_y
-        wy[9] = 220 << Q_SHIFT   # pitch
+        wy[1] = 280 << Q_SHIFT   # nose_y
+        wy[3] = 260 << Q_SHIFT   # pitch
+        wy[5] = 120 << Q_SHIFT   # pup_avg_y
         wy[13] = 512 << Q_SHIFT
         return cls(wx_q12=wx, wy_q12=wy)
 
@@ -161,14 +161,14 @@ class IntegerGazeCalibrator:
         cls,
         features: Sequence[np.ndarray] | np.ndarray,
         targets_norm: Sequence[Tuple[float, float]] | np.ndarray,
-        ridge_lambda: float = 1200.0,
+        ridge_lambda: float = 500.0,
         blink_thresh_l: int = 24,
         blink_thresh_r: int = 24,
         ear_thresh_l: int = 165,
         ear_thresh_r: int = 165,
         sample_weights: Optional[Sequence[float]] = None,
     ) -> "IntegerGazeCalibrator":
-        """Fit weighted ridge regression (giving extra weight to extreme corners) and quantize to Q12."""
+        """Fit SNR-tiered weighted ridge regression (nose-primary, eye-refined) and quantize to Q12."""
         X = np.asarray(features, dtype=np.float64)
         Y = np.asarray(targets_norm, dtype=np.float64)
         if X.ndim != 2 or X.shape[1] != CAL_FEAT_DIM:
@@ -185,19 +185,23 @@ class IntegerGazeCalibrator:
 
         Y_u16 = np.clip(Y, 0.0, 1.0) * 65535.0
         Xw = X * w[:, None]
-        reg = np.eye(CAL_FEAT_DIM, dtype=np.float64) * ridge_lambda
-        # Stronger regularization on quadratic terms so edges stay smooth
-        reg[10, 10] = ridge_lambda * 6.0
-        reg[11, 11] = ridge_lambda * 6.0
-        reg[12, 12] = ridge_lambda * 6.0
-        reg[-1, -1] = 1e-3
+
+        # SNR-tiered regularization:
+        #   [0..3] nose_x, nose_y, yaw, pitch -> primary low-noise backbone (1.0x lambda)
+        #   [4..7] averaged pupils + Q27 eye  -> bounded fine correction (4.5x lambda)
+        #   [8..12] vergence + quadratic      -> heavily damped against noise (14.0x lambda)
+        #   [13]   constant bias              -> unregularized
+        tier = np.array(
+            [1.0, 1.0, 1.0, 1.0, 4.5, 4.5, 5.5, 5.5, 14.0, 14.0, 14.0, 14.0, 14.0, 1e-6],
+            dtype=np.float64,
+        )
+        reg = np.diag(tier * float(ridge_lambda))
 
         A = Xw.T @ X + reg
         W = np.linalg.solve(A, Xw.T @ Y_u16)
         wx_q12 = np.clip(np.rint(W[:, 0] * Q_SCALE), -(1 << 30), (1 << 30) - 1).astype(np.int32)
         wy_q12 = np.clip(np.rint(W[:, 1] * Q_SCALE), -(1 << 30), (1 << 30) - 1).astype(np.int32)
 
-        # Measure integer fit error in % of screen
         pred_x = np.clip((X.astype(np.int64) @ wx_q12.astype(np.int64)) >> Q_SHIFT, 0, 65535)
         pred_y = np.clip((X.astype(np.int64) @ wy_q12.astype(np.int64)) >> Q_SHIFT, 0, 65535)
         mae_x = float(np.mean(np.abs(pred_x - Y_u16[:, 0])) / 655.35)
@@ -240,7 +244,7 @@ class IntegerGazeCalibrator:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "format": "ternara_gaze_cal_q12_v2",
+            "format": "ternara_gaze_cal_q12_v3",
             "q_shift": Q_SHIFT,
             "feat_dim": CAL_FEAT_DIM,
             "wx_q12": [int(v) for v in self.wx_q12],
@@ -257,7 +261,7 @@ class IntegerGazeCalibrator:
     @classmethod
     def load(cls, path: str | Path) -> "IntegerGazeCalibrator":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if data.get("format") != "ternara_gaze_cal_q12_v2":
+        if data.get("format") != "ternara_gaze_cal_q12_v3":
             raise ValueError(f"Unsupported or outdated calibration format: {data.get('format')}; please re-run calibrate.")
         return cls(
             wx_q12=np.asarray(data["wx_q12"], dtype=np.int32),
