@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import Vision
 import CoreGraphics
+import ApplicationServices
 
 // Ternara-Gaze Native macOS Camera + Eye-ROI + CoreGraphics Mouse Bridge
 // - Zero OpenCV / MediaPipe dependencies
@@ -29,6 +30,7 @@ func moveMouseU16(xU16: Int, yU16: Int) {
     let x = bounds.origin.x + (Double(max(0, min(65535, xU16))) / 65535.0) * bounds.width
     let y = bounds.origin.y + (Double(max(0, min(65535, yU16))) / 65535.0) * bounds.height
     let pt = CGPoint(x: x, y: y)
+    CGWarpMouseCursorPosition(pt)
     if let ev = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: .left) {
         ev.post(tap: .cghidEventTap)
     }
@@ -54,7 +56,6 @@ func cropEyeU4(
     bytesPerRow: Int,
     boxNorm: CGRect
 ) -> [UInt8] {
-    // Vision uses bottom-left origin; CVPixelBuffer uses top-left origin.
     let x0 = max(0.0, min(1.0, Double(boxNorm.minX)))
     let x1 = max(x0 + 0.01, min(1.0, Double(boxNorm.maxX)))
     let yTop = max(0.0, min(1.0, 1.0 - Double(boxNorm.maxY)))
@@ -68,7 +69,7 @@ func cropEyeU4(
         for c in 0..<EYE_W {
             let fx = x0 + (Double(c) + 0.5) / Double(EYE_W) * (x1 - x0)
             let px = max(0, min(width - 1, Int(fx * Double(width))))
-            out[r * EYE_W + c] = rowPtr[px] >> 4 // 8-bit luma -> 4-bit [0..15]
+            out[r * EYE_W + c] = rowPtr[px] >> 4
         }
     }
     return out
@@ -88,7 +89,6 @@ func eyeBoxInImage(faceBox: CGRect, region: VNFaceLandmarkRegion2D) -> CGRect {
         minY = min(minY, iy)
         maxY = max(maxY, iy)
     }
-    // Pad eye box generously so eyelids + sclera corners stay inside 32x16 ROI
     let w = max(0.02, maxX - minX)
     let h = max(0.015, maxY - minY)
     let cx = (minX + maxX) * 0.5
@@ -116,25 +116,36 @@ func packNibblesHex(left: [UInt8], right: [UInt8]) -> String {
 
 final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let startTime = DispatchTime.now().uptimeNanoseconds
-    private var frameCount = 0
+    var rawFrames = 0
+    var eyeFrames = 0
+    let diagMode: Bool
+
+    init(diagMode: Bool) {
+        self.diagMode = diagMode
+    }
 
     func captureOutput(
         _ output: AVCaptureOutput,
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        rawFrames += 1
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let req = VNDetectFaceLandmarksRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up, options: [:])
         do {
             try handler.perform([req])
         } catch {
+            if diagMode { fputs("vision_error=\(error)\n", stderr) }
             return
         }
         guard let face = req.results?.first,
               let lm = face.landmarks,
               let leftEye = lm.leftEye,
               let rightEye = lm.rightEye else {
+            if diagMode && (rawFrames == 1 || rawFrames % 15 == 0) {
+                fputs("diag raw_frame=\(rawFrames) faces=\(req.results?.count ?? 0)\n", stderr)
+            }
             return
         }
 
@@ -154,16 +165,15 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let rightU4 = cropEyeU4(yBase: yPtr, width: w, height: h, bytesPerRow: bpr, boxNorm: rightBox)
         let hexStr = packNibblesHex(left: leftU4, right: rightU4)
 
-        // Mirror horizontal head anchor so moving head right moves cursor right naturally
         let faceCx = Double(face.boundingBox.midX)
         let faceCy = 1.0 - Double(face.boundingBox.midY)
         let headX = max(-128, min(127, Int((0.5 - faceCx) * 256.0)))
         let headY = max(-128, min(127, Int((faceCy - 0.5) * 256.0)))
         let nowMs = Int((DispatchTime.now().uptimeNanoseconds - startTime) / 1_000_000)
         let (mx, my) = currentMouseU16()
-        frameCount += 1
+        eyeFrames += 1
 
-        let line = "{\"seq\":\(frameCount),\"ts_ms\":\(nowMs),\"head_x\":\(headX),\"head_y\":\(headY),\"mx_u16\":\(mx),\"my_u16\":\(my),\"eyes_hex\":\"\(hexStr)\"}\n"
+        let line = "{\"seq\":\(eyeFrames),\"ts_ms\":\(nowMs),\"head_x\":\(headX),\"head_y\":\(headY),\"mx_u16\":\(mx),\"my_u16\":\(my),\"eyes_hex\":\"\(hexStr)\"}\n"
         if let data = line.data(using: .utf8) {
             FileHandle.standardOutput.write(data)
         }
@@ -173,10 +183,13 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
 let args = CommandLine.arguments
 if args.contains("--self-test") {
     let b = screenBounds()
-    print("{\"status\":\"ok\",\"screen_w\":\(Int(b.width)),\"screen_h\":\(Int(b.height)),\"eye_roi\":\"32x16x4bit\"}")
+    let ax = AXIsProcessTrusted()
+    let camAuth = AVCaptureDevice.authorizationStatus(for: .video).rawValue
+    print("{\"status\":\"ok\",\"screen_w\":\(Int(b.width)),\"screen_h\":\(Int(b.height)),\"eye_roi\":\"32x16x4bit\",\"accessibility_trusted\":\(ax),\"camera_auth\":\(camAuth)}")
     exit(0)
 }
 
+let diagMode = args.contains("--diag")
 let liveMouse = args.contains("--live")
 if liveMouse {
     DispatchQueue.global(qos: .userInteractive).async {
@@ -199,11 +212,23 @@ if liveMouse {
 let session = AVCaptureSession()
 session.sessionPreset = .vga640x480
 
-guard let device = AVCaptureDevice.default(for: .video) else {
+let discovery = AVCaptureDevice.DiscoverySession(
+    deviceTypes: [.builtInWideAngleCamera, .external],
+    mediaType: .video,
+    position: .unspecified
+)
+// Prefer built-in FaceTime HD camera over external BoardCam iPhones
+let device = discovery.devices.first(where: { $0.localizedName.contains("FaceTime") })
+    ?? AVCaptureDevice.default(for: .video)
+
+guard let cam = device else {
     fputs("ERROR: No camera device found. Grant Camera permission to Terminal/Orca.\n", stderr)
     exit(2)
 }
-guard let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else {
+if diagMode {
+    fputs("diag camera=\(cam.localizedName) auth=\(AVCaptureDevice.authorizationStatus(for: .video).rawValue) ax=\(AXIsProcessTrusted())\n", stderr)
+}
+guard let input = try? AVCaptureDeviceInput(device: cam), session.canAddInput(input) else {
     fputs("ERROR: Cannot open camera input.\n", stderr)
     exit(3)
 }
@@ -215,7 +240,7 @@ output.videoSettings = [
 ]
 output.alwaysDiscardsLateVideoFrames = true
 
-let delegate = GazeCaptureDelegate()
+let delegate = GazeCaptureDelegate(diagMode: diagMode)
 let queue = DispatchQueue(label: "ternara.gaze.capture")
 output.setSampleBufferDelegate(delegate, queue: queue)
 guard session.canAddOutput(output) else {
@@ -224,4 +249,11 @@ guard session.canAddOutput(output) else {
 }
 session.addOutput(output)
 session.startRunning()
+
+if diagMode {
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 4.0))
+    session.stopRunning()
+    fputs("diag summary raw_frames=\(delegate.rawFrames) eye_frames=\(delegate.eyeFrames)\n", stderr)
+    exit(0)
+}
 RunLoop.main.run()
