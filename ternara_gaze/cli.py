@@ -34,19 +34,15 @@ DEFAULT_CAL = Path("weights/user_calibration.json")
 DEFAULT_BRIDGE = Path("build/gaze_bridge")
 
 RU_TARGET_LABELS: Tuple[str, ...] = (
-    "1/13  ЛЕВЫЙ ВЕРХНИЙ УГОЛ",
-    "2/13  ПРАВЫЙ ВЕРХНИЙ УГОЛ",
-    "3/13  ПРАВЫЙ НИЖНИЙ УГОЛ",
-    "4/13  ЛЕВЫЙ НИЖНИЙ УГОЛ",
-    "5/13  ЦЕНТР ЭКРАНА",
-    "6/13  ВЕРХНИЙ КРАЙ",
-    "7/13  ПРАВЫЙ КРАЙ",
-    "8/13  НИЖНИЙ КРАЙ",
-    "9/13  ЛЕВЫЙ КРАЙ",
-    "10/13 ВЕРХ-ЛЕВО",
-    "11/13 ВЕРХ-ПРАВО",
-    "12/13 НИЗ-ПРАВО",
-    "13/13 НИЗ-ЛЕВО",
+    "1/9  ЛЕВЫЙ ВЕРХНИЙ УГОЛ",
+    "2/9  ПРАВЫЙ ВЕРХНИЙ УГОЛ",
+    "3/9  ПРАВЫЙ НИЖНИЙ УГОЛ",
+    "4/9  ЛЕВЫЙ НИЖНИЙ УГОЛ",
+    "5/9  ЦЕНТР ЭКРАНА",
+    "6/9  ВЕРХНИЙ КРАЙ",
+    "7/9  ПРАВЫЙ КРАЙ",
+    "8/9  НИЖНИЙ КРАЙ",
+    "9/9  ЛЕВЫЙ КРАЙ",
 )
 
 
@@ -303,7 +299,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         # Phases 1..13: 4 Extreme Corners first, then center/edges/inner + Blink-to-Advance!
         settle_sec = 0.70
         capture_sec = 1.15
-        blink_timeout_sec = 6.5
+        blink_timeout_sec = 3.5
 
         for idx, (tx, ty, eng_label) in enumerate(CORNER_FIRST_GRID):
             label = RU_TARGET_LABELS[idx] if idx < len(RU_TARGET_LABELS) else eng_label
@@ -383,8 +379,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
             min_er_seen = local_ear_r
             max_bl_seen = local_bl
             max_br_seen = local_br
-            ear_cut_l = max(85, int(local_ear_l * 0.74))
-            ear_cut_r = max(85, int(local_ear_r * 0.74))
+            ear_cut_l = max(120, int(local_ear_l * 0.80))
+            ear_cut_r = max(120, int(local_ear_r * 0.80))
 
             while True:
                 if time.monotonic() - t_wait >= blink_timeout_sec:
@@ -474,7 +470,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     cal = IntegerGazeCalibrator.fit(
         all_feats,
         all_targets,
-        ridge_lambda=500.0,
+        ridge_lambda=600.0,
         blink_thresh_l=tl,
         blink_thresh_r=tr,
         ear_thresh_l=ear_tl,
@@ -485,7 +481,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     _speak_async("Калибровка завершена. Включаю плавный второй курсор.")
     print(
         f"\nSaved Q12 v3 Nose+Eye HD Lock calibration -> {args.cal_out}\n"
-        f"  Stable samples : {len(all_feats)} / {raw_total} raw frames across 13 targets\n"
+        f"  Stable samples : {len(all_feats)} / {raw_total} raw frames across 9 corner-first targets\n"
         f"  Fit accuracy   : MAE X = {cal.fit_mae_pct_x:.2f}% | MAE Y = {cal.fit_mae_pct_y:.2f}% of screen\n"
         f"  Blink thresh   : Q27=({tl},{tr}) | HD EAR=({ear_tl},{ear_tr}) (from {len(blink_ear_l_mins)} real blinks)",
         flush=True,

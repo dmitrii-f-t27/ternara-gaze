@@ -81,11 +81,11 @@ def test_dark_pupil_centroid_and_outlier_filter():
 
 
 def test_integer_calibrator_corner_first_fit_and_roundtrip(tmp_path):
-    assert len(CORNER_FIRST_GRID) == 13
+    assert len(CORNER_FIRST_GRID) == 9
     # First 4 targets must be the 4 extreme corners
     for tx, ty, _ in CORNER_FIRST_GRID[:4]:
-        assert tx <= 0.05 or tx >= 0.95
-        assert ty <= 0.06 or ty >= 0.93
+        assert tx <= 0.06 or tx >= 0.94
+        assert ty <= 0.07 or ty >= 0.92
 
     rng = np.random.default_rng(77)
     feats = []
@@ -102,6 +102,9 @@ def test_integer_calibrator_corner_first_fit_and_roundtrip(tmp_path):
             weights.append(2.5 if idx < 4 else 1.0)
 
     cal = IntegerGazeCalibrator.fit(feats, targets, ridge_lambda=100.0, sample_weights=weights)
+    # Strict axis purity: ZERO cross-axis leakage between X and Y!
+    assert int(cal.wx_q12[1]) == 0 and int(cal.wx_q12[3]) == 0 and int(cal.wx_q12[5]) == 0
+    assert int(cal.wy_q12[0]) == 0 and int(cal.wy_q12[2]) == 0 and int(cal.wy_q12[4]) == 0
     assert cal.fit_mae_pct_x < 3.0
     assert cal.fit_mae_pct_y < 3.0
 

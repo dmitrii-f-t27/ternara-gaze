@@ -1,16 +1,13 @@
-"""Pure-integer Q12 Nose-Anchored + Eye-Refined corner-first gaze calibrator (0 floats at inference).
+"""Pure-integer Q12 Axis-Pure Nose-Anchored + Eye-Refined gaze calibrator (0 floats, 0 cross-axis leakage).
 
-Uses 14 physically orthogonal integer features ordered by signal-to-noise ratio (SNR):
-  [0..1]   HD nose-tip pointer (nose_x, nose_y) in [-128..+127]       -- PRIMARY ultra-low-noise backbone
-  [2..3]   3D nose-to-eye orientation (yaw, pitch) in [-128..+127]    -- PRIMARY head rotation backbone
-  [4..5]   averaged rigid pupils ((pup_lx+pup_rx)//2, (pup_ly+pup_ry)//2) -- bounded fine eye refinement
-  [6..7]   Q27 0-DSP ternary backbone raw (gaze_x, gaze_y)            -- bounded fine eye refinement
-  [8..9]   pupil vergence/asymmetry ((pup_lx-pup_rx)//2, (pup_ly-pup_ry)//2)
-  [10..12] mild quadratic terms of the clean nose+yaw/pitch signal
-  [13]     constant bias = 64
+Feature vector layout (CAL_FEAT_DIM = 14):
+  X-axis active slots [0, 2, 4, 6, 13]: nose_x, yaw,   pup_avg_x, q27_gx, bias(64)
+  Y-axis active slots [1, 3, 5, 7, 13]: nose_y, pitch, pup_avg_y, q27_gy, bias(64)
 
-Tiered ridge regularization ensures the rock-solid nose pointer carries the coarse screen zone
-without ever amplifying webcam pupil noise into cursor wander.
+Decoupling X and Y fits guarantees:
+  - Moving nose/eyes horizontally NEVER leaks into vertical cursor motion.
+  - Moving nose/eyes vertically NEVER leaks into horizontal cursor motion.
+  - Only 5 parameters per axis fitted over 9 corner-first targets (~250 frames) -> zero overfitting.
 """
 
 from __future__ import annotations
@@ -26,23 +23,23 @@ Q_SHIFT = 12
 Q_SCALE = 1 << Q_SHIFT  # 4096
 CAL_FEAT_DIM = 14
 
+X_ACTIVE_IDX = (0, 2, 4, 6, 13)
+Y_ACTIVE_IDX = (1, 3, 5, 7, 13)
+
+# 9-point corner-first calibration grid (4 TRUE extreme corners FIRST, then center + 4 edges):
 CORNER_FIRST_GRID: Tuple[Tuple[float, float, str], ...] = (
-    (0.04, 0.05, "1/13  TOP-LEFT CORNER"),
-    (0.96, 0.05, "2/13  TOP-RIGHT CORNER"),
-    (0.96, 0.94, "3/13  BOTTOM-RIGHT CORNER"),
-    (0.04, 0.94, "4/13  BOTTOM-LEFT CORNER"),
-    (0.50, 0.50, "5/13  SCREEN CENTER"),
-    (0.50, 0.05, "6/13  TOP EDGE"),
-    (0.96, 0.50, "7/13  RIGHT EDGE"),
-    (0.50, 0.94, "8/13  BOTTOM EDGE"),
-    (0.04, 0.50, "9/13  LEFT EDGE"),
-    (0.26, 0.28, "10/13 UPPER-LEFT"),
-    (0.74, 0.28, "11/13 UPPER-RIGHT"),
-    (0.74, 0.72, "12/13 LOWER-RIGHT"),
-    (0.26, 0.72, "13/13 LOWER-LEFT"),
+    (0.05, 0.06, "1/9  TOP-LEFT CORNER"),
+    (0.95, 0.06, "2/9  TOP-RIGHT CORNER"),
+    (0.95, 0.93, "3/9  BOTTOM-RIGHT CORNER"),
+    (0.05, 0.93, "4/9  BOTTOM-LEFT CORNER"),
+    (0.50, 0.50, "5/9  SCREEN CENTER"),
+    (0.50, 0.06, "6/9  TOP EDGE"),
+    (0.95, 0.50, "7/9  RIGHT EDGE"),
+    (0.50, 0.93, "8/9  BOTTOM EDGE"),
+    (0.05, 0.50, "9/9  LEFT EDGE"),
 )
 
-NINE_POINT_GRID_NORM: Tuple[Tuple[float, float], ...] = tuple((x, y) for x, y, _ in CORNER_FIRST_GRID[:9])
+NINE_POINT_GRID_NORM: Tuple[Tuple[float, float], ...] = tuple((x, y) for x, y, _ in CORNER_FIRST_GRID)
 
 
 def dark_pupil_centroid_int(crop_u4: np.ndarray) -> Tuple[int, int]:
@@ -85,13 +82,6 @@ def build_cal_feature(
     pup_avg_y = (int(pup_ly) + int(pup_ry)) >> 1
     pup_diff_x = (int(pup_lx) - int(pup_rx)) >> 1
     pup_diff_y = (int(pup_ly) - int(pup_ry)) >> 1
-
-    # Clean quadratic interaction on the low-noise nose+orientation signal
-    ax = (nose_x + int(yaw)) >> 1
-    ay = (nose_y + int(pitch)) >> 1
-    q_xx = max(-128, min(127, (ax * ax) >> 7))
-    q_yy = max(-128, min(127, (ay * ay) >> 7))
-    q_xy = max(-128, min(127, (ax * ay) >> 7))
     return np.array(
         [
             nose_x,
@@ -104,9 +94,9 @@ def build_cal_feature(
             int(gaze_y),
             pup_diff_x,
             pup_diff_y,
-            q_xx,
-            q_yy,
-            q_xy,
+            0,
+            0,
+            0,
             64,
         ],
         dtype=np.int32,
@@ -125,16 +115,38 @@ def filter_target_outliers(samples: Sequence[np.ndarray], keep_ratio: float = 0.
     return [samples[int(i)] for i in order]
 
 
+def _fit_axis(
+    X_full: np.ndarray,
+    y_u16: np.ndarray,
+    w: np.ndarray,
+    active_idx: Tuple[int, ...],
+    ridge_lambda: float,
+) -> np.ndarray:
+    """Fit a clean 5-parameter axis-pure weighted ridge regression -> (14,) int32 Q12 vector."""
+    X_sub = X_full[:, active_idx]
+    Xw = X_sub * w[:, None]
+    # [nose, pose, pup_avg, q27_gaze, bias]
+    tier = np.array([1.0, 1.0, 4.5, 6.0, 1e-6], dtype=np.float64)
+    reg = np.diag(tier * float(ridge_lambda))
+    w_sub = np.linalg.solve(Xw.T @ X_sub + reg, Xw.T @ y_u16)
+
+    out = np.zeros(CAL_FEAT_DIM, dtype=np.int32)
+    lim = (1 << 30) - 1
+    for j, col in enumerate(active_idx):
+        out[col] = int(np.clip(np.rint(w_sub[j] * Q_SCALE), -lim, lim))
+    return out
+
+
 @dataclass(frozen=True)
 class IntegerGazeCalibrator:
-    """Fixed-point Q12 screen coordinate mapper (0 floats at inference)."""
+    """Fixed-point Q12 axis-pure screen coordinate mapper (0 floats at inference)."""
 
-    wx_q12: np.ndarray  # (14,) int32
-    wy_q12: np.ndarray  # (14,) int32
+    wx_q12: np.ndarray  # (14,) int32 (non-zero only on X_ACTIVE_IDX)
+    wy_q12: np.ndarray  # (14,) int32 (non-zero only on Y_ACTIVE_IDX)
     blink_thresh_l: int = 24
     blink_thresh_r: int = 24
-    ear_thresh_l: int = 165
-    ear_thresh_r: int = 165
+    ear_thresh_l: int = 340
+    ear_thresh_r: int = 340
     fit_mae_pct_x: float = 0.0
     fit_mae_pct_y: float = 0.0
     online_updates: int = 0
@@ -147,12 +159,12 @@ class IntegerGazeCalibrator:
     def identity_default(cls) -> "IntegerGazeCalibrator":
         wx = np.zeros(CAL_FEAT_DIM, dtype=np.int32)
         wy = np.zeros(CAL_FEAT_DIM, dtype=np.int32)
-        wx[0] = 260 << Q_SHIFT   # nose_x
-        wx[2] = 240 << Q_SHIFT   # yaw
+        wx[0] = 320 << Q_SHIFT   # nose_x
+        wx[2] = 280 << Q_SHIFT   # yaw
         wx[4] = 120 << Q_SHIFT   # pup_avg_x
         wx[13] = 512 << Q_SHIFT  # center
-        wy[1] = 280 << Q_SHIFT   # nose_y
-        wy[3] = 260 << Q_SHIFT   # pitch
+        wy[1] = 360 << Q_SHIFT   # nose_y
+        wy[3] = 300 << Q_SHIFT   # pitch
         wy[5] = 120 << Q_SHIFT   # pup_avg_y
         wy[13] = 512 << Q_SHIFT
         return cls(wx_q12=wx, wy_q12=wy)
@@ -162,14 +174,14 @@ class IntegerGazeCalibrator:
         cls,
         features: Sequence[np.ndarray] | np.ndarray,
         targets_norm: Sequence[Tuple[float, float]] | np.ndarray,
-        ridge_lambda: float = 500.0,
+        ridge_lambda: float = 600.0,
         blink_thresh_l: int = 24,
         blink_thresh_r: int = 24,
-        ear_thresh_l: int = 165,
-        ear_thresh_r: int = 165,
+        ear_thresh_l: int = 340,
+        ear_thresh_r: int = 340,
         sample_weights: Optional[Sequence[float]] = None,
     ) -> "IntegerGazeCalibrator":
-        """Fit SNR-tiered weighted ridge regression (nose-primary, eye-refined) and quantize to Q12."""
+        """Fit strictly axis-pure weighted ridge regression (zero cross-axis leakage)."""
         X = np.asarray(features, dtype=np.float64)
         Y = np.asarray(targets_norm, dtype=np.float64)
         if X.ndim != 2 or X.shape[1] != CAL_FEAT_DIM:
@@ -179,29 +191,11 @@ class IntegerGazeCalibrator:
         if X.shape[0] < 4:
             raise ValueError("Need at least 4 calibration samples")
 
-        if sample_weights is None:
-            w = np.ones(X.shape[0], dtype=np.float64)
-        else:
-            w = np.asarray(sample_weights, dtype=np.float64)
-
+        w = np.ones(X.shape[0], dtype=np.float64) if sample_weights is None else np.asarray(sample_weights, dtype=np.float64)
         Y_u16 = np.clip(Y, 0.0, 1.0) * 65535.0
-        Xw = X * w[:, None]
 
-        # SNR-tiered regularization:
-        #   [0..3] nose_x, nose_y, yaw, pitch -> primary low-noise backbone (1.0x lambda)
-        #   [4..7] averaged pupils + Q27 eye  -> bounded fine correction (4.5x lambda)
-        #   [8..12] vergence + quadratic      -> heavily damped against noise (14.0x lambda)
-        #   [13]   constant bias              -> unregularized
-        tier = np.array(
-            [1.0, 1.0, 1.0, 1.0, 4.5, 4.5, 5.5, 5.5, 14.0, 14.0, 14.0, 14.0, 14.0, 1e-6],
-            dtype=np.float64,
-        )
-        reg = np.diag(tier * float(ridge_lambda))
-
-        A = Xw.T @ X + reg
-        W = np.linalg.solve(A, Xw.T @ Y_u16)
-        wx_q12 = np.clip(np.rint(W[:, 0] * Q_SCALE), -(1 << 30), (1 << 30) - 1).astype(np.int32)
-        wy_q12 = np.clip(np.rint(W[:, 1] * Q_SCALE), -(1 << 30), (1 << 30) - 1).astype(np.int32)
+        wx_q12 = _fit_axis(X, Y_u16[:, 0], w, X_ACTIVE_IDX, ridge_lambda)
+        wy_q12 = _fit_axis(X, Y_u16[:, 1], w, Y_ACTIVE_IDX, ridge_lambda)
 
         pred_x = np.clip((X.astype(np.int64) @ wx_q12.astype(np.int64)) >> Q_SHIFT, 0, 65535)
         pred_y = np.clip((X.astype(np.int64) @ wy_q12.astype(np.int64)) >> Q_SHIFT, 0, 65535)
@@ -241,7 +235,6 @@ class IntegerGazeCalibrator:
         sy = int(np.dot(f, self.wy_q12.astype(np.int64))) >> Q_SHIFT
         return max(0, min(65535, sx)), max(0, min(65535, sy))
 
-
     def online_learn_step(
         self,
         feat: np.ndarray,
@@ -250,11 +243,7 @@ class IntegerGazeCalibrator:
         lr: float = 0.14,
         max_error_u16: int = 19000,
     ) -> Tuple["IntegerGazeCalibrator", bool]:
-        """Safe bounded SNR-tiered NLMS online adaptation step (returns (updated_cal, applied)).
-
-        Triggered when the user clicks with their real mouse/trackpad or confirms a magnetically
-        locked UI button, continuously adapting the Q12 model to posture, lighting, and gaze habits.
-        """
+        """Safe axis-pure NLMS online adaptation step (never leaks across X/Y axes)."""
         f = np.asarray(feat, dtype=np.float64)
         if f.shape != (CAL_FEAT_DIM,):
             return self, False
@@ -266,28 +255,30 @@ class IntegerGazeCalibrator:
 
         ex = float(tx - pred_x)
         ey = float(ty - pred_y)
-        # Safety guard: skip if user clicked without looking near the target (>29% screen away)
         if abs(ex) > max_error_u16 or abs(ey) > max_error_u16:
             return self, False
 
-        # SNR-tiered learning weights: strong adaptation on bias & nose/pose, gentle on eyes
-        tier_inv = np.array(
-            [1.0, 1.0, 1.0, 1.0, 0.28, 0.28, 0.22, 0.22, 0.06, 0.06, 0.04, 0.04, 0.04, 1.6],
-            dtype=np.float64,
-        )
-        denom = float(np.sum(tier_inv * (f * f))) + 8000.0
-        step_scale = (lr / denom) * float(Q_SCALE)
-        dwx = np.rint(ex * step_scale * tier_inv * f).astype(np.int64)
-        dwy = np.rint(ey * step_scale * tier_inv * f).astype(np.int64)
-
         lim = (1 << 30) - 1
-        new_wx = np.clip(self.wx_q12.astype(np.int64) + dwx, -lim, lim).astype(np.int32)
-        new_wy = np.clip(self.wy_q12.astype(np.int64) + dwy, -lim, lim).astype(np.int32)
+        new_wx = self.wx_q12.astype(np.int64).copy()
+        new_wy = self.wy_q12.astype(np.int64).copy()
+
+        # Axis-pure X update
+        tier_sub = np.array([1.0, 1.0, 0.28, 0.20, 1.6], dtype=np.float64)
+        fx = f[list(X_ACTIVE_IDX)]
+        dx_step = (lr / (float(np.sum(tier_sub * fx * fx)) + 8000.0)) * float(Q_SCALE)
+        for j, col in enumerate(X_ACTIVE_IDX):
+            new_wx[col] += int(np.rint(ex * dx_step * tier_sub[j] * fx[j]))
+
+        # Axis-pure Y update
+        fy = f[list(Y_ACTIVE_IDX)]
+        dy_step = (lr / (float(np.sum(tier_sub * fy * fy)) + 8000.0)) * float(Q_SCALE)
+        for j, col in enumerate(Y_ACTIVE_IDX):
+            new_wy[col] += int(np.rint(ey * dy_step * tier_sub[j] * fy[j]))
 
         return (
             IntegerGazeCalibrator(
-                wx_q12=new_wx,
-                wy_q12=new_wy,
+                wx_q12=np.clip(new_wx, -lim, lim).astype(np.int32),
+                wy_q12=np.clip(new_wy, -lim, lim).astype(np.int32),
                 blink_thresh_l=self.blink_thresh_l,
                 blink_thresh_r=self.blink_thresh_r,
                 ear_thresh_l=self.ear_thresh_l,
@@ -303,7 +294,7 @@ class IntegerGazeCalibrator:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "format": "ternara_gaze_cal_q12_v3",
+            "format": "ternara_gaze_cal_q12_v4",
             "q_shift": Q_SHIFT,
             "feat_dim": CAL_FEAT_DIM,
             "wx_q12": [int(v) for v in self.wx_q12],
@@ -321,15 +312,15 @@ class IntegerGazeCalibrator:
     @classmethod
     def load(cls, path: str | Path) -> "IntegerGazeCalibrator":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if data.get("format") != "ternara_gaze_cal_q12_v3":
+        if data.get("format") != "ternara_gaze_cal_q12_v4":
             raise ValueError(f"Unsupported or outdated calibration format: {data.get('format')}; please re-run calibrate.")
         return cls(
             wx_q12=np.asarray(data["wx_q12"], dtype=np.int32),
             wy_q12=np.asarray(data["wy_q12"], dtype=np.int32),
             blink_thresh_l=int(data.get("blink_thresh_l", 24)),
             blink_thresh_r=int(data.get("blink_thresh_r", 24)),
-            ear_thresh_l=int(data.get("ear_thresh_l", 165)),
-            ear_thresh_r=int(data.get("ear_thresh_r", 165)),
+            ear_thresh_l=int(data.get("ear_thresh_l", 340)),
+            ear_thresh_r=int(data.get("ear_thresh_r", 340)),
             fit_mae_pct_x=float(data.get("fit_mae_pct_x", 0.0)),
             fit_mae_pct_y=float(data.get("fit_mae_pct_y", 0.0)),
             online_updates=int(data.get("online_updates", 0)),

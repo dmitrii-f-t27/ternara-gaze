@@ -712,17 +712,26 @@ func eyeBoxInImage(faceBox: CGRect, region: VNFaceLandmarkRegion2D) -> CGRect {
     return CGRect(x: cx - boxW * 0.5, y: cy - boxH * 0.5, width: boxW, height: boxH)
 }
 
+func landmarkToPixel(_ p: CGPoint, faceBox: CGRect, imgW: Double, imgH: Double) -> CGPoint {
+    let ix = (Double(faceBox.origin.x) + Double(p.x) * Double(faceBox.size.width)) * imgW
+    // Vision origin is bottom-left; keep Y-up in pixel space for clean Euclidean ratios
+    let iy = (Double(faceBox.origin.y) + Double(p.y) * Double(faceBox.size.height)) * imgH
+    return CGPoint(x: ix, y: iy)
+}
+
 func rigidEyePupilAndEAR(
+    faceBox: CGRect,
+    imgW: Double,
+    imgH: Double,
     eye: VNFaceLandmarkRegion2D,
     pupil: VNFaceLandmarkRegion2D?
-) -> (px: Double, py: Double, ear: Int, center: CGPoint, width: CGFloat) {
-    let pts = eye.normalizedPoints
-    guard !pts.isEmpty else { return (0, 0, 0, CGPoint(x: 0.5, y: 0.5), 0.1) }
-
+) -> (px: Double, py: Double, ear: Int, centerPx: CGPoint, widthPx: Double) {
+    let pts = eye.pointsInImage(imageSize: CGSize(width: imgW, height: imgH))
+    guard !pts.isEmpty else { return (0, 0, 0, CGPoint(x: imgW * 0.5, y: imgH * 0.5), 40.0) }
     var leftCorner = pts[0]
     var rightCorner = pts[0]
-    var minY: CGFloat = 1.0
-    var maxY: CGFloat = 0.0
+    var minY = pts[0].y
+    var maxY = pts[0].y
     for pt in pts {
         if pt.x < leftCorner.x { leftCorner = pt }
         if pt.x > rightCorner.x { rightCorner = pt }
@@ -730,53 +739,56 @@ func rigidEyePupilAndEAR(
         maxY = max(maxY, pt.y)
     }
 
-    let w = max(0.008, rightCorner.x - leftCorner.x)
-    let h = max(0.001, maxY - minY)
-    let ear = max(0, min(500, Int((h / w) * 1000.0)))
+    // True isotropic pixel-space Eye Aspect Ratio (open ~240..360, closed ~60..150)
+    let wPx = max(6.0, Double(rightCorner.x - leftCorner.x))
+    let hPx = max(1.0, Double(maxY - minY))
+    let ear = max(0, min(999, Int((hPx / wPx) * 1000.0)))
 
-    let cornerMidX = (leftCorner.x + rightCorner.x) * 0.5
-    let cornerMidY = (leftCorner.y + rightCorner.y) * 0.5
-    let center = CGPoint(x: cornerMidX, y: cornerMidY)
+    let cornerMidX = Double(leftCorner.x + rightCorner.x) * 0.5
+    let cornerMidY = Double(leftCorner.y + rightCorner.y) * 0.5
+    let centerPx = CGPoint(x: cornerMidX, y: cornerMidY)
 
-    guard let p = pupil?.normalizedPoints.first else {
-        return (0, 0, ear, center, w)
+    guard let pPx = pupil?.pointsInImage(imageSize: CGSize(width: imgW, height: imgH)).first else {
+        return (0, 0, ear, centerPx, wPx)
     }
-    let relX = -Double((p.x - cornerMidX) / w) * 320.0
-    let relY = -Double((p.y - cornerMidY) / w) * 520.0
-    return (relX, relY, ear, center, w)
+    // True isotropic pixel offset relative to rigid eye-corner line (mirrored X, down-positive Y)
+    let relX = -((Double(pPx.x) - cornerMidX) / wPx) * 280.0
+    let relY = -((Double(pPx.y) - cornerMidY) / wPx) * 420.0
+    return (relX, relY, ear, centerPx, wPx)
 }
 
 func noseTipAndPose(
     faceBox: CGRect,
-    leftEyeCenter: CGPoint,
-    rightEyeCenter: CGPoint,
+    imgW: Double,
+    imgH: Double,
+    leftEyePx: CGPoint,
+    rightEyePx: CGPoint,
     nose: VNFaceLandmarkRegion2D?,
     noseCrest: VNFaceLandmarkRegion2D?
 ) -> (noseX: Double, noseY: Double, yaw: Double, pitch: Double) {
-    let eyeMidX = (leftEyeCenter.x + rightEyeCenter.x) * 0.5
-    let eyeMidY = (leftEyeCenter.y + rightEyeCenter.y) * 0.5
-    let iod = max(0.05, abs(rightEyeCenter.x - leftEyeCenter.x))
+    let eyeMidX = Double(leftEyePx.x + rightEyePx.x) * 0.5
+    let eyeMidY = Double(leftEyePx.y + rightEyePx.y) * 0.5
+    let iodPx = max(20.0, abs(Double(rightEyePx.x - leftEyePx.x)))
 
-    // Use bottom-most point of noseCrest (the true 3D nose tip!) or centroid of nose
-    var tipLocal = CGPoint(x: eyeMidX, y: eyeMidY - 0.35 * iod)
-    if let crest = noseCrest?.normalizedPoints, let last = crest.last {
-        tipLocal = last
-    } else if let nPts = nose?.normalizedPoints, !nPts.isEmpty {
-        var nx: CGFloat = 0.0
-        var ny: CGFloat = 0.0
-        for p in nPts { nx += p.x; ny += p.y }
-        tipLocal = CGPoint(x: nx / CGFloat(nPts.count), y: ny / CGFloat(nPts.count))
+    let imgSz = CGSize(width: imgW, height: imgH)
+    var tipPx = CGPoint(x: eyeMidX, y: eyeMidY - 0.50 * iodPx)
+    if let crest = noseCrest?.pointsInImage(imageSize: imgSz), let last = crest.last {
+        tipPx = last
+    } else if let nPts = nose?.pointsInImage(imageSize: imgSz), !nPts.isEmpty {
+        var sx = 0.0, sy = 0.0
+        for pp in nPts { sx += Double(pp.x); sy += Double(pp.y) }
+        tipPx = CGPoint(x: sx / Double(nPts.count), y: sy / Double(nPts.count))
     }
 
-    // Full image-space nose tip coordinate (rigid skull pointer!)
-    let imgX = Double(faceBox.origin.x + tipLocal.x * faceBox.size.width)
-    let imgY = 1.0 - Double(faceBox.origin.y + tipLocal.y * faceBox.size.height)
-    let noseX = (0.5 - imgX) * 512.0   // mirrored so pointing right is positive
-    let noseY = (imgY - 0.5) * 512.0   // pointing down is positive
+    // Full-frame normalized nose-tip coordinate scaled to [-110..+110] -> NEVER saturates at 127!
+    let normX = Double(tipPx.x) / max(1.0, imgW)
+    let normY = 1.0 - (Double(tipPx.y) / max(1.0, imgH))  // top=0, bottom=1
+    let noseX = (0.5 - normX) * 220.0  // mirrored: moving/turning right -> positive
+    let noseY = (normY - 0.5) * 220.0  // moving/tilting down -> positive
 
-    // 3D nose-tip vector relative to inter-ocular midpoint (pure head rotation!)
-    let yaw = -Double((tipLocal.x - eyeMidX) / iod) * 380.0
-    let pitch = (Double((eyeMidY - tipLocal.y) / iod) - 0.42) * 380.0
+    // True isotropic 3D nose-tip vector relative to inter-ocular midpoint
+    let yaw = -((Double(tipPx.x) - eyeMidX) / iodPx) * 260.0
+    let pitch = (((eyeMidY - Double(tipPx.y)) / iodPx) - 0.55) * 260.0
     return (noseX, noseY, yaw, pitch)
 }
 
@@ -843,14 +855,27 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
             return
         }
 
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+
+        guard let basePtr = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { return }
+        let yPtr = basePtr.assumingMemoryBound(to: UInt8.self)
+        let w = CVPixelBufferGetWidthOfPlane(pb, 0)
+        let h = CVPixelBufferGetHeightOfPlane(pb, 0)
+        let bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+        let imgW = Double(w)
+        let imgH = Double(h)
+
         let leftBox = eyeBoxInImage(faceBox: face.boundingBox, region: leftEye)
         let rightBox = eyeBoxInImage(faceBox: face.boundingBox, region: rightEye)
-        let lGeom = rigidEyePupilAndEAR(eye: leftEye, pupil: lm.leftPupil)
-        let rGeom = rigidEyePupilAndEAR(eye: rightEye, pupil: lm.rightPupil)
+        let lGeom = rigidEyePupilAndEAR(faceBox: face.boundingBox, imgW: imgW, imgH: imgH, eye: leftEye, pupil: lm.leftPupil)
+        let rGeom = rigidEyePupilAndEAR(faceBox: face.boundingBox, imgW: imgW, imgH: imgH, eye: rightEye, pupil: lm.rightPupil)
         let nPose = noseTipAndPose(
             faceBox: face.boundingBox,
-            leftEyeCenter: lGeom.center,
-            rightEyeCenter: rGeom.center,
+            imgW: imgW,
+            imgH: imgH,
+            leftEyePx: lGeom.centerPx,
+            rightEyePx: rGeom.centerPx,
             nose: lm.nose,
             noseCrest: lm.noseCrest
         )
@@ -862,8 +887,8 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
             sPupRX = rGeom.px; sPupRY = rGeom.py
             hasEma = true
         } else {
-            let aNose = 0.45  // crisp nose tracking with zero micro-chatter
-            let aPup = 0.35   // calmer pupil refinement
+            let aNose = 0.45
+            let aPup = 0.35
             sNoseX += (nPose.noseX - sNoseX) * aNose
             sNoseY += (nPose.noseY - sNoseY) * aNose
             sYaw += (nPose.yaw - sYaw) * aNose
@@ -882,15 +907,6 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
         let pupLYInt = clampI8(sPupLY)
         let pupRXInt = clampI8(sPupRX)
         let pupRYInt = clampI8(sPupRY)
-
-        CVPixelBufferLockBaseAddress(pb, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-
-        guard let basePtr = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { return }
-        let yPtr = basePtr.assumingMemoryBound(to: UInt8.self)
-        let w = CVPixelBufferGetWidthOfPlane(pb, 0)
-        let h = CVPixelBufferGetHeightOfPlane(pb, 0)
-        let bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
 
         let leftU4 = cropEyeU4(yBase: yPtr, width: w, height: h, bytesPerRow: bpr, boxNorm: leftBox)
         let rightU4 = cropEyeU4(yBase: yPtr, width: w, height: h, bytesPerRow: bpr, boxNorm: rightBox)
