@@ -155,3 +155,21 @@ def test_cursor_controller_blink_and_override_safety():
     d_paused = ctrl.step(60000, 60000, -50, -50, now_ms=5500)
     assert d_paused.paused_by_user is True
     assert d_paused.x_u16 == 30000
+
+
+def test_fixation_lock_eliminates_micro_tremor_and_ear_click():
+    ctrl = GazeCursorController(FilterConfig(ear_threshold_l=160, ear_threshold_r=160))
+    d0 = ctrl.step(30000, 30000, -50, -50, now_ms=0, ear_l=280, ear_r=280)
+    assert (d0.x_u16, d0.y_u16) == (30000, 30000)
+
+    # Small ±900 u16 webcam micro-tremor around fixation must produce ZERO movement!
+    for i in range(1, 10):
+        jitter = 900 if (i % 2 == 0) else -900
+        d = ctrl.step(30000 + jitter, 30000 - jitter, -50, -50, now_ms=i * 33, ear_l=280, ear_r=280)
+        assert (d.x_u16, d.y_u16) == (30000, 30000)
+
+    # Deliberate EAR-only blink (320 ms) triggers left_click even when Q27 logit is low
+    d_cl = ctrl.step(30000, 30000, -50, -50, now_ms=1000, ear_l=95, ear_r=95)
+    assert d_cl.frozen is True
+    d_op = ctrl.step(30000, 30000, -50, -50, now_ms=1320, ear_l=280, ear_r=280)
+    assert d_op.click == "left_click"

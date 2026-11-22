@@ -131,6 +131,8 @@ class IntegerGazeCalibrator:
     wy_q12: np.ndarray  # (14,) int32
     blink_thresh_l: int = 24
     blink_thresh_r: int = 24
+    ear_thresh_l: int = 165
+    ear_thresh_r: int = 165
     fit_mae_pct_x: float = 0.0
     fit_mae_pct_y: float = 0.0
 
@@ -162,6 +164,8 @@ class IntegerGazeCalibrator:
         ridge_lambda: float = 1200.0,
         blink_thresh_l: int = 24,
         blink_thresh_r: int = 24,
+        ear_thresh_l: int = 165,
+        ear_thresh_r: int = 165,
         sample_weights: Optional[Sequence[float]] = None,
     ) -> "IntegerGazeCalibrator":
         """Fit weighted ridge regression (giving extra weight to extreme corners) and quantize to Q12."""
@@ -204,6 +208,8 @@ class IntegerGazeCalibrator:
             wy_q12=wy_q12,
             blink_thresh_l=int(blink_thresh_l),
             blink_thresh_r=int(blink_thresh_r),
+            ear_thresh_l=int(ear_thresh_l),
+            ear_thresh_r=int(ear_thresh_r),
             fit_mae_pct_x=round(mae_x, 2),
             fit_mae_pct_y=round(mae_y, 2),
         )
@@ -241,6 +247,8 @@ class IntegerGazeCalibrator:
             "wy_q12": [int(v) for v in self.wy_q12],
             "blink_thresh_l": int(self.blink_thresh_l),
             "blink_thresh_r": int(self.blink_thresh_r),
+            "ear_thresh_l": int(self.ear_thresh_l),
+            "ear_thresh_r": int(self.ear_thresh_r),
             "fit_mae_pct_x": self.fit_mae_pct_x,
             "fit_mae_pct_y": self.fit_mae_pct_y,
         }
@@ -256,6 +264,8 @@ class IntegerGazeCalibrator:
             wy_q12=np.asarray(data["wy_q12"], dtype=np.int32),
             blink_thresh_l=int(data.get("blink_thresh_l", 24)),
             blink_thresh_r=int(data.get("blink_thresh_r", 24)),
+            ear_thresh_l=int(data.get("ear_thresh_l", 165)),
+            ear_thresh_r=int(data.get("ear_thresh_r", 165)),
             fit_mae_pct_x=float(data.get("fit_mae_pct_x", 0.0)),
             fit_mae_pct_y=float(data.get("fit_mae_pct_y", 0.0)),
         )

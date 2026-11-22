@@ -1,17 +1,4 @@
-"""Fixed-point low-jitter cursor filter (median + adaptive 1-Euro EMA) and safe blink/wink clicker.
-
-Designed for a smooth, non-jittery second virtual gaze cursor:
-1. 3-sample median pre-filter eliminates single-frame camera/landmark spikes.
-2. Hysteresis deadzone (~1.0% screen) + smooth adaptive EMA (Q8 alpha in [18..110]) +
-   max-step velocity clamp gives silky-smooth fixation and crisp saccades without tremor.
-3. Reflex-blink rejection: normal human blinks (< 180 ms) are ignored.
-   - Deliberate both-eye blink (260..750 ms) or left wink (220..650 ms) -> Left Click.
-   - Right wink (240..650 ms) -> Right Click.
-   - Eyes held closed > 850 ms -> Rest/pause (no click).
-   - Cursor freezes during closure so clicks never drift off target.
-4. Optional physical-mouse pause (for main-cursor mode); in virtual-cursor mode your real
-   mouse is never moved except for an atomic Computer-Use click + instant restore.
-"""
+"""Integer Fixation-Lock 1-Euro smoother + 5-sample median + safe blink/wink click machine."""
 
 from __future__ import annotations
 
@@ -22,24 +9,30 @@ from typing import Deque, Literal, Optional
 ClickEvent = Literal["none", "left_click", "right_click"]
 
 
-def _median3(vals: Deque[int]) -> int:
-    s = sorted(vals)
+def _median_int(buf: Deque[int]) -> int:
+    s = sorted(buf)
     return s[len(s) // 2]
 
 
 @dataclass(frozen=True)
 class FilterConfig:
-    alpha_min_q8: int = 18          # ~0.07 rock-steady fixation
-    alpha_max_q8: int = 110         # ~0.43 smooth saccade glide
-    velocity_boost_shift: int = 7   # gentle velocity ramp (zero twitching)
-    deadzone_u16: int = 650         # ~1.0% screen micro-tremor suppression
-    max_step_u16: int = 4800        # clamp single-frame jumps (~7.3% screen)
-    blink_threshold: int = 24       # default integer logit threshold for closed eye
+    """All timing in milliseconds; coordinates in [0, 65535]."""
+
+    median_window: int = 5          # 5-sample integer median crushes 1-2 frame webcam glitches
+    alpha_min_q8: int = 12          # ultra-calm (~4.7%) right outside fixation deadzone
+    alpha_max_q8: int = 132         # brisk glide (~51%) during intentional across-screen saccades
+    deadzone_u16: int = 1300        # ~2.0% screen fixation-lock radius (0 px micro-tremor!)
+    lock_release_u16: int = 2400    # ~3.6% hysteresis radius before unlocking a steady fixation
+    velocity_boost_shift: int = 7   # smooth velocity ramp on saccades
+    max_step_u16: int = 5200        # clamp single-frame spikes (~7.9% screen)
+    blink_threshold: int = 24       # default integer Q27 logit threshold for closed eye
     blink_threshold_l: Optional[int] = None
     blink_threshold_r: Optional[int] = None
-    deliberate_blink_min_ms: int = 260
+    ear_threshold_l: Optional[int] = None  # HD Eye Aspect Ratio (0..500) threshold when available
+    ear_threshold_r: Optional[int] = None
+    deliberate_blink_min_ms: int = 240
     deliberate_blink_max_ms: int = 750
-    wink_min_ms: int = 220
+    wink_min_ms: int = 210
     wink_max_ms: int = 650
     click_cooldown_ms: int = 550
     override_pause_ms: int = 1500
@@ -56,15 +49,16 @@ class CursorDecision:
 
 
 class GazeCursorController:
-    """Stateful fixed-point cursor smoother + safe blink/wink click state machine."""
+    """Stateful fixed-point fixation-lock cursor smoother + safe blink/wink click state machine."""
 
     def __init__(self, config: Optional[FilterConfig] = None) -> None:
         self.cfg = config or FilterConfig()
         self._has_pos = False
         self._x: int = 32768
         self._y: int = 32768
-        self._hist_x: Deque[int] = deque(maxlen=3)
-        self._hist_y: Deque[int] = deque(maxlen=3)
+        self._locked: bool = True
+        self._hist_x: Deque[int] = deque(maxlen=max(1, self.cfg.median_window))
+        self._hist_y: Deque[int] = deque(maxlen=max(1, self.cfg.median_window))
         self._last_click_ms: int = -10_000
         self._pause_until_ms: int = -10_000
 
@@ -83,14 +77,20 @@ class GazeCursorController:
         blink_left: int,
         blink_right: int,
         now_ms: int,
+        ear_l: Optional[int] = None,
+        ear_r: Optional[int] = None,
     ) -> CursorDecision:
         rx = max(0, min(65535, int(raw_x_u16)))
         ry = max(0, min(65535, int(raw_y_u16)))
 
         tl = self.cfg.blink_threshold if self.cfg.blink_threshold_l is None else self.cfg.blink_threshold_l
         tr = self.cfg.blink_threshold if self.cfg.blink_threshold_r is None else self.cfg.blink_threshold_r
-        l_closed = int(blink_left) > tl
-        r_closed = int(blink_right) > tr
+        l_closed = int(blink_left) > tl or (
+            ear_l is not None and self.cfg.ear_threshold_l is not None and int(ear_l) < self.cfg.ear_threshold_l
+        )
+        r_closed = int(blink_right) > tr or (
+            ear_r is not None and self.cfg.ear_threshold_r is not None and int(ear_r) < self.cfg.ear_threshold_r
+        )
 
         if now_ms < self._pause_until_ms:
             self._both_closed_start_ms = None
@@ -170,18 +170,29 @@ class GazeCursorController:
         if not frozen:
             self._hist_x.append(rx)
             self._hist_y.append(ry)
-            mx = _median3(self._hist_x)
-            my = _median3(self._hist_y)
+            mx = _median_int(self._hist_x)
+            my = _median_int(self._hist_y)
 
             if not self._has_pos:
                 self._x = mx
                 self._y = my
                 self._has_pos = True
+                self._locked = True
             else:
                 dx = mx - self._x
                 dy = my - self._y
                 dist = abs(dx) + abs(dy)
-                if dist > self.cfg.deadzone_u16:
+
+                # Fixation-lock hysteresis: stay dead-still inside lock_release_u16 when locked;
+                # once moving, settle smoothly all the way down to deadzone_u16 before re-locking.
+                if self._locked:
+                    if dist > self.cfg.lock_release_u16:
+                        self._locked = False
+                else:
+                    if dist <= self.cfg.deadzone_u16:
+                        self._locked = True
+
+                if not self._locked and dist > self.cfg.deadzone_u16:
                     boost = (dist - self.cfg.deadzone_u16) >> self.cfg.velocity_boost_shift
                     alpha = min(self.cfg.alpha_max_q8, self.cfg.alpha_min_q8 + boost)
                     step_x = max(-self.cfg.max_step_u16, min(self.cfg.max_step_u16, (dx * alpha) >> 8))
