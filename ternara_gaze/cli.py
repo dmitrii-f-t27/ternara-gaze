@@ -1,4 +1,4 @@
-"""Command-line interface for Ternara-Gaze."""
+"""Command-line interface for Ternara-Gaze (with floating second virtual cursor)."""
 
 from __future__ import annotations
 
@@ -76,7 +76,6 @@ def cmd_verify(args: argparse.Namespace) -> int:
         max_diff = max(max_diff, max(diffs))
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    # Fault check: reserved pack5 bytes 243..255 must raise Pack5FaultError
     faults_rejected = 0
     for bad_byte in range(243, 256):
         try:
@@ -117,7 +116,6 @@ def cmd_demo_sim(args: argparse.Namespace) -> int:
     backend = OracleLoopbackBackend(cart)
     ds = generate_dataset(60, seed=4242)
 
-    # Fit 9-point style integer calibrator on synthetic samples
     open_idx = [i for i in range(len(ds.targets)) if ds.targets[i, 2] < 0 and ds.targets[i, 3] < 0]
     cal_feats = []
     cal_tgts = []
@@ -129,7 +127,6 @@ def cmd_demo_sim(args: argparse.Namespace) -> int:
     cal = IntegerGazeCalibrator.fit(cal_feats, cal_tgts)
     ctrl = GazeCursorController()
 
-    # Simulate fixation + deliberate 350ms blink click
     clicks = 0
     now_ms = 0
     for step_idx in range(25):
@@ -137,7 +134,7 @@ def cmd_demo_sim(args: argparse.Namespace) -> int:
         out = backend.infer(ds.left_u4[i], ds.right_u4[i], want_h2=True)
         bl, br = out.blink_left, out.blink_right
         if 10 <= step_idx <= 16:
-            bl, br = 40, 40  # simulated 350 ms deliberate blink
+            bl, br = 40, 40
         sx, sy = cal.predict_u16(out.h2, out.gaze_x, out.gaze_y, 0, 0)
         dec = ctrl.step(sx, sy, bl, br, now_ms)
         if dec.click != "none":
@@ -175,17 +172,18 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         "MIDDLE-LEFT", "CENTER", "MIDDLE-RIGHT",
         "BOTTOM-LEFT", "BOTTOM-CENTER", "BOTTOM-RIGHT",
     ]
-    print("Ternara-Gaze 9-Point Calibration (zero raw video saved)")
-    print("Keep your head comfortable and look at each screen region as prompted.\n")
+    print("Ternara-Gaze 9-Point Visual Calibration (zero raw video saved)", flush=True)
+    print("Look straight at the glowing green target dot on your screen.\n", flush=True)
 
     proc = subprocess.Popen(
-        [str(bridge)],
+        [str(bridge), "--overlay"],
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=sys.stderr,
         text=True,
         bufsize=1,
     )
-    assert proc.stdout is not None
+    assert proc.stdout is not None and proc.stdin is not None
     feats: List[np.ndarray] = []
     targets: List[Tuple[float, float]] = []
     open_bl: List[int] = []
@@ -193,15 +191,25 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
 
     try:
         for (tx, ty), name in zip(NINE_POINT_GRID_NORM, labels):
-            print(f"  -> Look at {name:14s} ({int(tx*100):2d}%, {int(ty*100):2d}%) — hold steady...", flush=True)
-            # Warmup 0.6s then collect frames for 1.2s
+            tx_u16 = int(tx * 65535)
+            ty_u16 = int(ty * 65535)
+            print(f"  -> Look at {name:14s} glowing dot...", flush=True)
+            proc.stdin.write(f"T {tx_u16} {ty_u16} 0\n")
+            proc.stdin.flush()
+
             t_start = time.monotonic()
             collected = 0
-            while time.monotonic() - t_start < 1.8:
+            while True:
+                elapsed = time.monotonic() - t_start
+                if elapsed >= 1.9:
+                    break
                 line = proc.stdout.readline()
                 if not line:
-                    raise SystemExit("Camera bridge stopped unexpectedly. Check macOS Camera permission.")
-                if time.monotonic() - t_start < 0.6:
+                    raise SystemExit("Camera bridge stopped unexpectedly.")
+                pct = 0 if elapsed < 0.6 else min(100, int((elapsed - 0.6) / 1.3 * 100))
+                proc.stdin.write(f"T {tx_u16} {ty_u16} {pct}\n")
+                proc.stdin.flush()
+                if elapsed < 0.6:
                     continue
                 msg = json.loads(line)
                 left_u4, right_u4 = unpack_dual_eye_nibbles(bytes.fromhex(msg["eyes_hex"]))
@@ -211,19 +219,24 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
                 open_bl.append(out.blink_left)
                 open_br.append(out.blink_right)
                 collected += 1
-            print(f"     captured {collected} open-eye frames", flush=True)
+            print(f"     captured {collected} frames", flush=True)
     finally:
+        try:
+            proc.stdin.write("Q\n")
+            proc.stdin.flush()
+        except Exception:
+            pass
         proc.terminate()
         proc.wait(timeout=3)
 
     if len(feats) < 12:
-        raise SystemExit(f"Too few open-eye frames captured ({len(feats)}). Ensure good lighting and retry.")
+        raise SystemExit(f"Too few frames captured ({len(feats)}). Ensure good lighting and retry.")
 
-    tl = int(np.percentile(open_bl, 95)) + 22
-    tr = int(np.percentile(open_br, 95)) + 22
-    cal = IntegerGazeCalibrator.fit(feats, targets, blink_thresh_l=tl, blink_thresh_r=tr)
+    tl = int(np.percentile(open_bl, 95)) + 24
+    tr = int(np.percentile(open_br, 95)) + 24
+    cal = IntegerGazeCalibrator.fit(feats, targets, ridge_lambda=4000.0, blink_thresh_l=tl, blink_thresh_r=tr)
     cal.save(args.cal_out)
-    print(f"\nSaved pure-integer Q12 calibration ({len(feats)} samples) -> {args.cal_out}")
+    print(f"\nSaved Q12 calibration ({len(feats)} samples, blink_thresh=({tl},{tr})) -> {args.cal_out}", flush=True)
     return 0
 
 
@@ -235,31 +248,35 @@ def cmd_run(args: argparse.Namespace) -> int:
     cal_path = Path(args.calibration)
     if cal_path.exists():
         cal = IntegerGazeCalibrator.load(cal_path)
-        print(f"Loaded calibration: {cal_path}")
+        print(f"Loaded calibration: {cal_path}", flush=True)
     else:
         cal = IntegerGazeCalibrator.identity_default()
-        print("No user calibration found; using default identity map (run `ternara-gaze calibrate` for best accuracy).")
+        print("No user calibration found; using default map (run `calibrate` first for best accuracy).", flush=True)
 
-    ctrl = GazeCursorController(FilterConfig(blink_threshold_l=cal.blink_thresh_l, blink_threshold_r=cal.blink_thresh_r))
-    cmd = [str(bridge)]
+    ctrl = GazeCursorController(
+        FilterConfig(blink_threshold_l=cal.blink_thresh_l, blink_threshold_r=cal.blink_thresh_r)
+    )
+    cmd = [str(bridge), "--overlay"]
     if args.live:
         cmd.append("--live")
-        print("LIVE MOUSE MODE ACTIVE: deliberate 300-600ms blink or left wink = Left Click; right wink = Right Click.")
-        print("SAFETY: Touch your trackpad/mouse anytime to pause gaze control for 1.5s, or press Ctrl+C to stop.")
+        print("SECOND VIRTUAL CURSOR + ATOMIC CLICK MODE ACTIVE:", flush=True)
+        print("  - Your main physical mouse/trackpad stays 100% free and untouched!", flush=True)
+        print("  - The glowing cyan reticle follows your eyes smoothly (60 FPS).", flush=True)
+        print("  - Deliberate blink (0.3-0.7s) or left wink = Left Click at reticle; right wink = Right Click.", flush=True)
+        print("  - Press Ctrl+C in this window anytime to stop.", flush=True)
     else:
-        print("DRY-RUN MODE (pass --live to move the actual macOS cursor). Press Ctrl+C to stop.")
+        print("OVERLAY PREVIEW MODE (floating cyan reticle only, clicks disabled; pass --live to enable clicks).", flush=True)
 
     proc = subprocess.Popen(
         cmd,
-        stdin=subprocess.PIPE if args.live else None,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=sys.stderr,
         text=True,
         bufsize=1,
     )
-    assert proc.stdout is not None
+    assert proc.stdout is not None and proc.stdin is not None
 
-    last_sent_pos: Optional[Tuple[int, int]] = None
     frames = 0
     try:
         while True:
@@ -268,41 +285,36 @@ def cmd_run(args: argparse.Namespace) -> int:
                 break
             msg = json.loads(line)
             now_ms = int(msg["ts_ms"])
-            mx, my = int(msg["mx_u16"]), int(msg["my_u16"])
-
-            # Detect physical mouse override if cursor moved >2% away from our last commanded position
-            if args.live and last_sent_pos is not None:
-                if abs(mx - last_sent_pos[0]) + abs(my - last_sent_pos[1]) > 1400:
-                    ctrl.notify_physical_mouse_moved(now_ms)
-                    last_sent_pos = (mx, my)
 
             left_u4, right_u4 = unpack_dual_eye_nibbles(bytes.fromhex(msg["eyes_hex"]))
             out = backend.infer(left_u4, right_u4, want_h2=True)
             sx, sy = cal.predict_u16(out.h2, out.gaze_x, out.gaze_y, msg["head_x"], msg["head_y"])
             dec = ctrl.step(sx, sy, out.blink_left, out.blink_right, now_ms)
 
-            if args.live and proc.stdin is not None and not dec.paused_by_user:
-                if not dec.frozen:
-                    proc.stdin.write(f"M {dec.x_u16} {dec.y_u16}\n")
-                    last_sent_pos = (dec.x_u16, dec.y_u16)
-                if dec.click == "left_click":
-                    proc.stdin.write("L\n")
-                elif dec.click == "right_click":
-                    proc.stdin.write("R\n")
-                proc.stdin.flush()
+            # Always update the smooth floating second cursor (never hijacks your physical mouse)
+            proc.stdin.write(f"G {dec.x_u16} {dec.y_u16} {dec.hold_progress_pct}\n")
+            if dec.click == "left_click":
+                proc.stdin.write(f"L {dec.x_u16} {dec.y_u16}\n")
+            elif dec.click == "right_click":
+                proc.stdin.write(f"R {dec.x_u16} {dec.y_u16}\n")
+            proc.stdin.flush()
 
             frames += 1
-            if frames % 10 == 0 or dec.click != "none":
+            if frames % 15 == 0 or dec.click != "none":
                 print(
                     f"frame={frames:5d} raw=({out.gaze_x:+4d},{out.gaze_y:+4d}) "
                     f"blink=({out.blink_left:+4d},{out.blink_right:+4d}) "
-                    f"cursor=({dec.x_u16:5d},{dec.y_u16:5d}) click={dec.click} "
-                    f"paused={dec.paused_by_user}",
+                    f"reticle=({dec.x_u16:5d},{dec.y_u16:5d}) click={dec.click}",
                     flush=True,
                 )
     except KeyboardInterrupt:
-        print("\nStopped cleanly.")
+        print("\nStopped cleanly.", flush=True)
     finally:
+        try:
+            proc.stdin.write("Q\n")
+            proc.stdin.flush()
+        except Exception:
+            pass
         proc.terminate()
         proc.wait(timeout=3)
     return 0
@@ -336,7 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sim.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     p_sim.set_defaults(func=cmd_demo_sim)
 
-    p_cal = sub.add_parser("calibrate", help="Run 9-point webcam calibration (macOS)")
+    p_cal = sub.add_parser("calibrate", help="Run 9-point visual on-screen calibration (macOS)")
     p_cal.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     p_cal.add_argument("--cal-out", default=str(DEFAULT_CAL))
     p_cal.add_argument("--bridge", default=str(DEFAULT_BRIDGE))
@@ -345,14 +357,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_cal.add_argument("--baudrate", type=int, default=921600)
     p_cal.set_defaults(func=cmd_calibrate)
 
-    p_run = sub.add_parser("run", help="Run live gaze-to-mouse tracking (macOS)")
+    p_run = sub.add_parser("run", help="Run smooth floating second-cursor gaze tracking (macOS)")
     p_run.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     p_run.add_argument("--calibration", default=str(DEFAULT_CAL))
     p_run.add_argument("--bridge", default=str(DEFAULT_BRIDGE))
     p_run.add_argument("--backend", choices=["oracle", "fpga-uart"], default="oracle")
     p_run.add_argument("--port", default="")
     p_run.add_argument("--baudrate", type=int, default=921600)
-    p_run.add_argument("--live", action="store_true", help="Actually move the macOS cursor and emit clicks")
+    p_run.add_argument("--live", action="store_true", help="Enable atomic Computer-Use clicks at the second cursor")
     p_run.set_defaults(func=cmd_run)
 
     return p

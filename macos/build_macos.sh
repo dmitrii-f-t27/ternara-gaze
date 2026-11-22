@@ -3,11 +3,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$ROOT/build"
 swiftc -O \
+  -framework AppKit \
   -framework AVFoundation \
   -framework Vision \
   -framework CoreGraphics \
   -framework CoreMedia \
   -framework CoreVideo \
+  -framework ApplicationServices \
   "$ROOT/macos/gaze_bridge.swift" \
   -o "$ROOT/build/gaze_bridge"
 echo "Built: $ROOT/build/gaze_bridge"
