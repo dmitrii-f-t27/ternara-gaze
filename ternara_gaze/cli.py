@@ -191,7 +191,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
 
     try:
         for (tx, ty), name in zip(NINE_POINT_GRID_NORM, labels):
-            print(f"  -> Look at {name:14s} ({int(tx*100):2d}%, {int(ty*100):2d}%) — hold steady...")
+            print(f"  -> Look at {name:14s} ({int(tx*100):2d}%, {int(ty*100):2d}%) — hold steady...", flush=True)
             # Warmup 0.6s then collect frames for 1.2s
             t_start = time.monotonic()
             collected = 0
@@ -208,7 +208,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
                     feats.append(build_cal_feature(out.h2, out.gaze_x, out.gaze_y, msg["head_x"], msg["head_y"]))
                     targets.append((tx, ty))
                     collected += 1
-            print(f"     captured {collected} open-eye frames")
+            print(f"     captured {collected} open-eye frames", flush=True)
     finally:
         proc.terminate()
         proc.wait(timeout=3)
@@ -289,7 +289,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                     f"frame={frames:5d} raw=({out.gaze_x:+4d},{out.gaze_y:+4d}) "
                     f"blink=({out.blink_left:+4d},{out.blink_right:+4d}) "
                     f"cursor=({dec.x_u16:5d},{dec.y_u16:5d}) click={dec.click} "
-                    f"paused={dec.paused_by_user}"
+                    f"paused={dec.paused_by_user}",
+                    flush=True,
                 )
     except KeyboardInterrupt:
         print("\nStopped cleanly.")
