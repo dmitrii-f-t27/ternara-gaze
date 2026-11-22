@@ -257,7 +257,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     last_sent_pos: Optional[Tuple[int, int]] = None
     frames = 0
     try:
-        for line in proc.stdout:
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
             msg = json.loads(line)
             now_ms = int(msg["ts_ms"])
             mx, my = int(msg["mx_u16"]), int(msg["my_u16"])
