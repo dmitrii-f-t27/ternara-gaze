@@ -27,7 +27,9 @@ class FilterConfig:
     alpha_max_q8: int = 192         # ~0.75 fast saccade tracking
     velocity_boost_shift: int = 5   # higher -> smoother; lower -> snappier
     deadzone_u16: int = 220         # ~0.33% of screen width micro-jitter suppression
-    blink_threshold: int = 12       # integer logit threshold for closed eye
+    blink_threshold: int = 24       # default integer logit threshold for closed eye
+    blink_threshold_l: Optional[int] = None
+    blink_threshold_r: Optional[int] = None
     deliberate_blink_min_ms: int = 260
     deliberate_blink_max_ms: int = 750
     wink_min_ms: int = 220
@@ -75,8 +77,10 @@ class GazeCursorController:
     ) -> CursorDecision:
         raw_x = max(0, min(65535, int(raw_x_u16)))
         raw_y = max(0, min(65535, int(raw_y_u16)))
-        l_closed = int(blink_left) > self.cfg.blink_threshold
-        r_closed = int(blink_right) > self.cfg.blink_threshold
+        tl = self.cfg.blink_threshold if self.cfg.blink_threshold_l is None else self.cfg.blink_threshold_l
+        tr = self.cfg.blink_threshold if self.cfg.blink_threshold_r is None else self.cfg.blink_threshold_r
+        l_closed = int(blink_left) > tl
+        r_closed = int(blink_right) > tr
 
         if now_ms < self._pause_until_ms:
             self._both_closed_start_ms = None

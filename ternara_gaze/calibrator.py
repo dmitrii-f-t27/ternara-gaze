@@ -53,6 +53,8 @@ class IntegerGazeCalibrator:
 
     wx_q12: np.ndarray  # (37,) int32
     wy_q12: np.ndarray  # (37,) int32
+    blink_thresh_l: int = 24
+    blink_thresh_r: int = 24
 
     def __post_init__(self) -> None:
         if self.wx_q12.shape != (CAL_FEAT_DIM,) or self.wy_q12.shape != (CAL_FEAT_DIM,):
@@ -80,6 +82,8 @@ class IntegerGazeCalibrator:
         features: Sequence[np.ndarray] | np.ndarray,
         targets_norm: Sequence[Tuple[float, float]] | np.ndarray,
         ridge_lambda: float = 2500.0,
+        blink_thresh_l: int = 24,
+        blink_thresh_r: int = 24,
     ) -> "IntegerGazeCalibrator":
         """Fit regularized ridge regression on calibration samples and quantize to Q12 int32."""
         X = np.asarray(features, dtype=np.float64)
@@ -101,7 +105,7 @@ class IntegerGazeCalibrator:
         wy_q12 = np.rint(W[:, 1] * Q_SCALE).astype(np.int64)
         wx_q12 = np.clip(wx_q12, -(1 << 30), (1 << 30) - 1).astype(np.int32)
         wy_q12 = np.clip(wy_q12, -(1 << 30), (1 << 30) - 1).astype(np.int32)
-        return cls(wx_q12=wx_q12, wy_q12=wy_q12)
+        return cls(wx_q12=wx_q12, wy_q12=wy_q12, blink_thresh_l=int(blink_thresh_l), blink_thresh_r=int(blink_thresh_r))
 
     def predict_u16(
         self,
@@ -127,6 +131,8 @@ class IntegerGazeCalibrator:
             "q_shift": Q_SHIFT,
             "wx_q12": [int(v) for v in self.wx_q12],
             "wy_q12": [int(v) for v in self.wy_q12],
+            "blink_thresh_l": int(self.blink_thresh_l),
+            "blink_thresh_r": int(self.blink_thresh_r),
         }
         p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -138,4 +144,6 @@ class IntegerGazeCalibrator:
         return cls(
             wx_q12=np.asarray(data["wx_q12"], dtype=np.int32),
             wy_q12=np.asarray(data["wy_q12"], dtype=np.int32),
+            blink_thresh_l=int(data.get("blink_thresh_l", 24)),
+            blink_thresh_r=int(data.get("blink_thresh_r", 24)),
         )

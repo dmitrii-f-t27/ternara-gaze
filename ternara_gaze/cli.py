@@ -188,6 +188,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     assert proc.stdout is not None
     feats: List[np.ndarray] = []
     targets: List[Tuple[float, float]] = []
+    open_bl: List[int] = []
+    open_br: List[int] = []
 
     try:
         for (tx, ty), name in zip(NINE_POINT_GRID_NORM, labels):
@@ -204,10 +206,11 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
                 msg = json.loads(line)
                 left_u4, right_u4 = unpack_dual_eye_nibbles(bytes.fromhex(msg["eyes_hex"]))
                 out = backend.infer(left_u4, right_u4, want_h2=True)
-                if out.blink_left <= 12 and out.blink_right <= 12:
-                    feats.append(build_cal_feature(out.h2, out.gaze_x, out.gaze_y, msg["head_x"], msg["head_y"]))
-                    targets.append((tx, ty))
-                    collected += 1
+                feats.append(build_cal_feature(out.h2, out.gaze_x, out.gaze_y, msg["head_x"], msg["head_y"]))
+                targets.append((tx, ty))
+                open_bl.append(out.blink_left)
+                open_br.append(out.blink_right)
+                collected += 1
             print(f"     captured {collected} open-eye frames", flush=True)
     finally:
         proc.terminate()
@@ -216,7 +219,9 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     if len(feats) < 12:
         raise SystemExit(f"Too few open-eye frames captured ({len(feats)}). Ensure good lighting and retry.")
 
-    cal = IntegerGazeCalibrator.fit(feats, targets)
+    tl = int(np.percentile(open_bl, 95)) + 22
+    tr = int(np.percentile(open_br, 95)) + 22
+    cal = IntegerGazeCalibrator.fit(feats, targets, blink_thresh_l=tl, blink_thresh_r=tr)
     cal.save(args.cal_out)
     print(f"\nSaved pure-integer Q12 calibration ({len(feats)} samples) -> {args.cal_out}")
     return 0
@@ -235,7 +240,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         cal = IntegerGazeCalibrator.identity_default()
         print("No user calibration found; using default identity map (run `ternara-gaze calibrate` for best accuracy).")
 
-    ctrl = GazeCursorController(FilterConfig())
+    ctrl = GazeCursorController(FilterConfig(blink_threshold_l=cal.blink_thresh_l, blink_threshold_r=cal.blink_thresh_r))
     cmd = [str(bridge)]
     if args.live:
         cmd.append("--live")
