@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import shutil
 import subprocess
@@ -291,6 +292,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
             if not line:
                 raise SystemExit("Camera bridge stopped unexpectedly.")
             msg = json.loads(line)
+            if "eyes_hex" not in msg:
+                continue
             el = int(msg.get("ear_l", 0))
             er = int(msg.get("ear_r", 0))
             if el > 80 and er > 80:
@@ -334,6 +337,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
                 proc.stdin.flush()
 
                 msg = json.loads(line)
+                if "eyes_hex" not in msg:
+                    continue
                 left_u4, right_u4 = unpack_dual_eye_nibbles(bytes.fromhex(msg["eyes_hex"]))
                 out = backend.infer(left_u4, right_u4, want_h2=True)
                 hx, hy, plx, ply, prx, pry, yaw, pitch = _extract_eye_kinematics(msg, left_u4, right_u4)
@@ -392,6 +397,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
                 if not line:
                     raise SystemExit("Camera bridge stopped unexpectedly.")
                 msg = json.loads(line)
+                if "eyes_hex" not in msg:
+                    continue
                 left_u4, right_u4 = unpack_dual_eye_nibbles(bytes.fromhex(msg["eyes_hex"]))
                 out = backend.infer(left_u4, right_u4, want_h2=False)
                 el = int(msg.get("ear_l", 0))
@@ -538,24 +545,54 @@ def cmd_run(args: argparse.Namespace) -> int:
     assert proc.stdout is not None and proc.stdin is not None
 
     frames = 0
+    recent_feats = deque(maxlen=4)
+    dirty_cal = False
     try:
         while True:
             line = proc.stdout.readline()
             if not line:
                 break
             msg = json.loads(line)
-            now_ms = int(msg["ts_ms"])
 
+            # Passive Online AI Learning: every time you click with your physical mouse/trackpad,
+            # the model silently refines its Q12 weights toward the exact pixel you looked at!
+            if msg.get("event") == "user_click":
+                if len(recent_feats) >= 2:
+                    f_med = np.median(np.asarray(recent_feats, dtype=np.float64), axis=0).astype(np.int32)
+                    cx_u16 = int(msg.get("x_u16", 32768))
+                    cy_u16 = int(msg.get("y_u16", 32768))
+                    new_cal, applied = cal.online_learn_step(f_med, cx_u16, cy_u16)
+                    if applied:
+                        cal = new_cal
+                        dirty_cal = True
+                        print(
+                            f"  ✦ Online AI learned from click ({cx_u16},{cy_u16}) -> total updates: {cal.online_updates}",
+                            flush=True,
+                        )
+                        if cal.online_updates % 3 == 0:
+                            cal.save(cal_path)
+                            dirty_cal = False
+                continue
+
+            if "eyes_hex" not in msg:
+                continue
+
+            now_ms = int(msg["ts_ms"])
             left_u4, right_u4 = unpack_dual_eye_nibbles(bytes.fromhex(msg["eyes_hex"]))
             out = backend.infer(left_u4, right_u4, want_h2=True)
             hx, hy, plx, ply, prx, pry, yaw, pitch = _extract_eye_kinematics(msg, left_u4, right_u4)
             el = int(msg["ear_l"]) if "ear_l" in msg and int(msg["ear_l"]) > 0 else None
             er = int(msg["ear_r"]) if "ear_r" in msg and int(msg["ear_r"]) > 0 else None
 
+            feat = build_cal_feature(out.h2, out.gaze_x, out.gaze_y, hx, hy, plx, ply, prx, pry, yaw, pitch)
             sx, sy = cal.predict_u16(out.h2, out.gaze_x, out.gaze_y, hx, hy, plx, ply, prx, pry, yaw, pitch)
             dec = ctrl.step(sx, sy, out.blink_left, out.blink_right, now_ms, ear_l=el, ear_r=er)
+            if not dec.frozen:
+                recent_feats.append(feat)
 
-            proc.stdin.write(f"G {dec.x_u16} {dec.y_u16} {dec.hold_progress_pct} {1 if dec.locked else 0}\n")
+            proc.stdin.write(
+                f"G {dec.x_u16} {dec.y_u16} {dec.hold_progress_pct} {dec.motion_state} {cal.online_updates}\n"
+            )
             if dec.click == "left_click":
                 proc.stdin.write(f"L {dec.x_u16} {dec.y_u16}\n")
             elif dec.click == "right_click":
@@ -565,14 +602,16 @@ def cmd_run(args: argparse.Namespace) -> int:
             frames += 1
             if frames % 15 == 0 or dec.click != "none":
                 print(
-                    f"frame={frames:5d} nose=({hx:+4d},{hy:+4d}) pup=({plx:+4d},{ply:+4d}) "
-                    f"pose=({yaw:+4d},{pitch:+4d}) ear=({el or 0:3d},{er or 0:3d}) "
-                    f"reticle=({dec.x_u16:5d},{dec.y_u16:5d}) lock={int(dec.locked)} click={dec.click}",
+                    f"frame={frames:5d} state={dec.motion_state:8s} ai={cal.online_updates:2d} "
+                    f"nose=({hx:+4d},{hy:+4d}) reticle=({dec.x_u16:5d},{dec.y_u16:5d}) click={dec.click}",
                     flush=True,
                 )
     except KeyboardInterrupt:
         print("\nStopped cleanly.", flush=True)
     finally:
+        if dirty_cal:
+            cal.save(cal_path)
+            print(f"Saved online-adapted AI weights ({cal.online_updates} updates) -> {cal_path}", flush=True)
         try:
             proc.stdin.write("Q\n")
             proc.stdin.flush()

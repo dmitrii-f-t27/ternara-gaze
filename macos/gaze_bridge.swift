@@ -49,7 +49,10 @@ func queryMagneticTargetRect(screenPt: CGPoint) -> CGRect? {
     return nil
 }
 
+var suppressUserClickUntilNs: UInt64 = 0
+
 func atomicClickAtPoint(target: CGPoint, right: Bool) {
+    suppressUserClickUntilNs = DispatchTime.now().uptimeNanoseconds + 120_000_000
     let b = screenBounds()
     let prevPt = CGEvent(source: nil)?.location ?? CGPoint(x: b.midX, y: b.midY)
 
@@ -87,6 +90,9 @@ final class GazeOverlayView: NSView {
     var renderY: CGFloat = 0.5
     var holdPct: CGFloat = 0.0
     var regionLocked: Bool = false
+    var motionState: String = "locked"
+    var learnedCount: Int = 0
+    var learnFlash: CGFloat = 0.0
     var snappedRect: CGRect? = nil  // in screen top-left coordinates
 
     var calPct: CGFloat = 0.0
@@ -414,21 +420,28 @@ final class GazeOverlayView: NSView {
             py = renderY * h
         }
 
-        // Compact top-right status badge
+        // Compact top-right status badge (shows Saccade-Reject state + Online AI Learning count)
         let badgeText: String
         let badgeColor: NSColor
+        let aiSuffix = learnedCount > 0 ? " • AI:\(learnedCount)" : ""
         if !eyeLocked {
             badgeText = "○ NO FACE"
             badgeColor = NSColor(calibratedRed: 1.0, green: 0.40, blue: 0.25, alpha: 0.95)
+        } else if learnFlash > 0.15 {
+            badgeText = "✦ AI ОБУЧИЛАСЬ (+\(learnedCount))"
+            badgeColor = NSColor(calibratedRed: 1.0, green: 0.88, blue: 0.20, alpha: 0.98)
+        } else if motionState == "gliding" {
+            badgeText = "→ ПЛАВНЫЙ ПЕРЕЛЁТ\(aiSuffix)"
+            badgeColor = NSColor(calibratedRed: 0.15, green: 0.90, blue: 1.0, alpha: 0.98)
+        } else if motionState == "scanning" {
+            badgeText = "◎ ВЗГЛЯД БЕГАЕТ (СТОП)\(aiSuffix)"
+            badgeColor = NSColor(calibratedRed: 0.58, green: 0.72, blue: 0.90, alpha: 0.92)
         } else if regionLocked && snappedRect != nil {
-            badgeText = "● TARGET LOCKED"
+            badgeText = "● ЦЕЛЬ ЗАФИКСИРОВАНА\(aiSuffix)"
             badgeColor = NSColor(calibratedRed: 0.18, green: 1.0, blue: 0.65, alpha: 0.98)
-        } else if regionLocked {
-            badgeText = "● ZONE LOCKED"
-            badgeColor = NSColor(calibratedRed: 0.16, green: 0.96, blue: 0.62, alpha: 0.95)
         } else {
-            badgeText = "◎ TRACKING (NOSE+EYE)"
-            badgeColor = NSColor(calibratedRed: 0.15, green: 0.88, blue: 1.0, alpha: 0.95)
+            badgeText = "● ОБЛАСТЬ ЗАФИКСИРОВАНА\(aiSuffix)"
+            badgeColor = NSColor(calibratedRed: 0.16, green: 0.96, blue: 0.62, alpha: 0.95)
         }
         let bAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .bold),
@@ -527,6 +540,7 @@ final class OverlayController {
             self.view.renderX += (self.view.targetX - self.view.renderX) * lerp
             self.view.renderY += (self.view.targetY - self.view.renderY) * lerp
             self.view.pulsePhase += 0.16
+            if self.view.learnFlash > 0.01 { self.view.learnFlash *= 0.92 } else { self.view.learnFlash = 0.0 }
             if self.view.clickFlash > 0.01 {
                 self.view.clickFlash *= 0.84
             } else {
@@ -576,9 +590,10 @@ final class OverlayController {
         }
     }
 
-    func updateGaze(xU16: Int, yU16: Int, holdPct: Int, locked: Bool) {
+    func updateGaze(xU16: Int, yU16: Int, holdPct: Int, state: String, learned: Int) {
         let clampedX = max(0, min(65535, xU16))
         let clampedY = max(0, min(65535, yU16))
+        let locked = (state == "locked" || state == "scanning")
         var snapRect: CGRect? = nil
         var snapPt: CGPoint? = nil
 
@@ -608,6 +623,11 @@ final class OverlayController {
         DispatchQueue.main.async {
             self.view.mode = "gaze"
             self.view.regionLocked = locked
+            self.view.motionState = state
+            if learned > self.view.learnedCount {
+                self.view.learnFlash = 1.0
+            }
+            self.view.learnedCount = learned
             self.view.targetX = CGFloat(clampedX) / 65535.0
             self.view.targetY = CGFloat(clampedY) / 65535.0
             self.view.holdPct = CGFloat(max(0, min(100, holdPct))) / 100.0
@@ -896,9 +916,7 @@ final class GazeCaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferD
 
         // Emit nose_x/nose_y (also aliased to head_x/head_y for clean backwards compatibility)
         let line = "{\"seq\":\(eyeFrames),\"ts_ms\":\(nowMs),\"head_x\":\(noseXInt),\"head_y\":\(noseYInt),\"nose_x\":\(noseXInt),\"nose_y\":\(noseYInt),\"yaw\":\(yawInt),\"pitch\":\(pitchInt),\"pup_lx\":\(pupLXInt),\"pup_ly\":\(pupLYInt),\"pup_rx\":\(pupRXInt),\"pup_ry\":\(pupRYInt),\"ear_l\":\(lGeom.ear),\"ear_r\":\(rGeom.ear),\"mx_u16\":\(mx),\"my_u16\":\(my),\"eyes_hex\":\"\(hexStr)\"}\n"
-        if let data = line.data(using: .utf8) {
-            FileHandle.standardOutput.write(data)
-        }
+        writeStdoutLine(line)
     }
 }
 
@@ -909,7 +927,7 @@ if args.contains("--self-test") {
     let b = screenBounds()
     let ax = AXIsProcessTrusted()
     let camAuth = AVCaptureDevice.authorizationStatus(for: .video).rawValue
-    print("{\"status\":\"ok\",\"screen_w\":\(Int(b.width)),\"screen_h\":\(Int(b.height)),\"camera_mode\":\"hd1280x720\",\"eye_roi\":\"32x16x4bit\",\"overlay\":\"virtual_second_cursor_v4_nose_region_lock\",\"accessibility_trusted\":\(ax),\"camera_auth\":\(camAuth)}")
+    print("{\"status\":\"ok\",\"screen_w\":\(Int(b.width)),\"screen_h\":\(Int(b.height)),\"camera_mode\":\"hd1280x720\",\"eye_roi\":\"32x16x4bit\",\"overlay\":\"virtual_second_cursor_v5_fixation_online_ai\",\"accessibility_trusted\":\(ax),\"camera_auth\":\(camAuth)}")
     exit(0)
 }
 
@@ -919,6 +937,26 @@ let clicksEnabled = args.contains("--live")
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+
+let stdoutLock = NSLock()
+func writeStdoutLine(_ line: String) {
+    if let data = line.data(using: .utf8) {
+        stdoutLock.lock()
+        FileHandle.standardOutput.write(data)
+        stdoutLock.unlock()
+    }
+}
+
+var clickMonitor: Any? = nil
+if overlayEnabled {
+    clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { _ in
+        if DispatchTime.now().uptimeNanoseconds < suppressUserClickUntilNs {
+            return
+        }
+        let (mx, my) = currentMouseU16()
+        writeStdoutLine("{\"event\":\"user_click\",\"x_u16\":\(mx),\"y_u16\":\(my)}\n")
+    }
+}
 
 var overlay: OverlayController? = nil
 if overlayEnabled {
@@ -933,8 +971,9 @@ if overlayEnabled {
                 overlay?.updateIntro(step: step, subtitle: sub)
             } else if cmd == "G", parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]) {
                 let pct = parts.count >= 4 ? (Int(parts[3]) ?? 0) : 0
-                let locked = parts.count >= 5 ? ((Int(parts[4]) ?? 0) != 0) : false
-                overlay?.updateGaze(xU16: x, yU16: y, holdPct: pct, locked: locked)
+                let st = parts.count >= 5 ? String(parts[4]) : "locked"
+                let lrn = parts.count >= 6 ? (Int(parts[5]) ?? 0) : 0
+                overlay?.updateGaze(xU16: x, yU16: y, holdPct: pct, state: st, learned: lrn)
             } else if cmd == "T", parts.count >= 5, let x = Int(parts[1]), let y = Int(parts[2]), let pct = Int(parts[3]) {
                 let state = String(parts[4])
                 let lbl = parts.count >= 6 ? String(parts[5]) : ""

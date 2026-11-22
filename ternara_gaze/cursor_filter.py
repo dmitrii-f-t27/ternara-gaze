@@ -1,12 +1,11 @@
-"""Sustained-Intent Magnetic Region-Lock smoother + 7-sample median + safe blink/wink click machine.
+"""Saccade-Rejecting Fixation-Cluster cursor controller + adaptive stillness detector + blink click machine.
 
-Eliminates cursor wander completely:
-- When LOCKED on a screen region, output stays 100% STATIC (0 px movement).
-- Lock ONLY releases when sustained gaze stays outside `unlock_radius_u16` for
-  `unlock_confirm_frames` consecutive frames (~165 ms), so 1-4 frame glitches never break lock.
-- While GLIDING to a new zone, velocity-adaptive integer 1-Euro smoothing glides swiftly,
-  then snaps back into LOCKED mode once gaze settles inside `settle_radius_u16` for
-  `settle_confirm_frames` frames.
+Core ergonomic principle (matched to human eye physiology):
+- Eyes constantly dart around (saccades / scanning). While the rolling gaze window has high
+  spatial spread (`spread > fixation_spread_u16`), the cursor DOES NOT REACT AT ALL (`0 px`).
+- ONLY when the user's gaze actually STOPS on a spot for ~300 ms (`spread <= fixation_spread_u16`)
+  does the controller commit that calm cluster centroid as the new destination and smoothly
+  glide the second cursor directly there, locking onto the region/button on arrival.
 """
 
 from __future__ import annotations
@@ -16,27 +15,19 @@ from dataclasses import dataclass
 from typing import Deque, Literal, Optional
 
 ClickEvent = Literal["none", "left_click", "right_click"]
-
-
-def _median_int(buf: Deque[int]) -> int:
-    s = sorted(buf)
-    return s[len(s) // 2]
+MotionState = Literal["scanning", "gliding", "locked"]
 
 
 @dataclass(frozen=True)
 class FilterConfig:
     """All timing in milliseconds; coordinates in [0, 65535]."""
 
-    median_window: int = 7            # 7-sample integer median crushes webcam outliers
-    alpha_min_q8: int = 24            # smooth glide speed near target
-    alpha_max_q8: int = 128           # brisk across-screen saccade speed
-    deadzone_u16: int = 1100          # fine micro-deadzone while gliding (~1.7% screen)
-    unlock_radius_u16: int = 3400     # ~5.2% screen radius required to break a region lock
-    unlock_confirm_frames: int = 5    # ~165 ms of sustained gaze outside radius to unlock
-    settle_radius_u16: int = 1750     # ~2.7% screen radius to snap into locked region
-    settle_confirm_frames: int = 6    # ~200 ms steady fixation to lock onto the region
-    velocity_boost_shift: int = 7
-    max_step_u16: int = 5200
+    fixation_window: int = 9          # ~300 ms rolling window at 30 FPS to confirm eyes truly stopped
+    fixation_spread_u16: int = 4800   # max trimmed X+Y span (~7.3% combined) to count as stopped fixation
+    retarget_deadzone_u16: int = 2100 # ~3.2% screen: ignore tiny shifts around already-locked spot
+    arrival_radius_u16: int = 420     # snap neatly to goal once glide arrives within ~0.6%
+    glide_alpha_q8: int = 58          # silky smooth glide (~22.6% per frame) once destination is committed
+    max_step_u16: int = 4600          # cap single-frame glide velocity for butter-smooth motion
     blink_threshold: int = 24
     blink_threshold_l: Optional[int] = None
     blink_threshold_r: Optional[int] = None
@@ -58,22 +49,25 @@ class CursorDecision:
     frozen: bool
     paused_by_user: bool
     hold_progress_pct: int = 0
-    locked: bool = False  # True when magnetically pinned on a region (0 px tremor)
+    locked: bool = False          # True when parked/locked on a spot (0 px movement)
+    motion_state: MotionState = "locked"  # "scanning" | "gliding" | "locked"
 
 
 class GazeCursorController:
-    """Stateful fixed-point Sustained-Intent Region-Lock smoother + safe blink/wink click machine."""
+    """Saccade-rejecting fixation-cluster controller: ignores darting eyes, glides only on calm stops."""
 
     def __init__(self, config: Optional[FilterConfig] = None) -> None:
         self.cfg = config or FilterConfig()
         self._has_pos = False
         self._x: int = 32768
         self._y: int = 32768
+        self._goal_x: int = 32768
+        self._goal_y: int = 32768
         self._locked: bool = True
-        self._escape_streak: int = 0
-        self._settle_streak: int = 0
-        self._hist_x: Deque[int] = deque(maxlen=max(1, self.cfg.median_window))
-        self._hist_y: Deque[int] = deque(maxlen=max(1, self.cfg.median_window))
+        self._motion_state: MotionState = "locked"
+
+        self._win_x: Deque[int] = deque(maxlen=max(3, self.cfg.fixation_window))
+        self._win_y: Deque[int] = deque(maxlen=max(3, self.cfg.fixation_window))
         self._last_click_ms: int = -10_000
         self._pause_until_ms: int = -10_000
 
@@ -84,6 +78,20 @@ class GazeCursorController:
     def notify_physical_mouse_moved(self, now_ms: int) -> None:
         """Yield gaze control immediately when user touches physical mouse/trackpad."""
         self._pause_until_ms = now_ms + self.cfg.override_pause_ms
+
+    def _window_stats(self) -> tuple[int, int, int]:
+        """Return robust (centroid_x, centroid_y, trimmed_spread_u16) of rolling gaze window."""
+        sx = sorted(self._win_x)
+        sy = sorted(self._win_y)
+        n = len(sx)
+        cx = sx[n // 2]
+        cy = sy[n // 2]
+        if n >= 7:
+            # Drop 1 lowest and 1 highest sample so a single webcam glitch never hides a true stop
+            spread = (sx[-2] - sx[1]) + (sy[-2] - sy[1])
+        else:
+            spread = (sx[-1] - sx[0]) + (sy[-1] - sy[0])
+        return cx, cy, spread
 
     def step(
         self,
@@ -119,6 +127,7 @@ class GazeCursorController:
                 paused_by_user=True,
                 hold_progress_pct=0,
                 locked=self._locked,
+                motion_state=self._motion_state,
             )
 
         click: ClickEvent = "none"
@@ -184,53 +193,57 @@ class GazeCursorController:
 
         frozen = l_closed or r_closed
         if not frozen:
-            self._hist_x.append(rx)
-            self._hist_y.append(ry)
-            mx = _median_int(self._hist_x)
-            my = _median_int(self._hist_y)
+            self._win_x.append(rx)
+            self._win_y.append(ry)
 
             if not self._has_pos:
-                self._x = mx
-                self._y = my
+                self._x = rx
+                self._y = ry
+                self._goal_x = rx
+                self._goal_y = ry
                 self._has_pos = True
                 self._locked = True
-                self._escape_streak = 0
-                self._settle_streak = 0
+                self._motion_state = "locked"
             else:
-                dx = mx - self._x
-                dy = my - self._y
-                dist = abs(dx) + abs(dy)
+                cx, cy, spread = self._window_stats()
+                is_fixated = (len(self._win_x) >= self.cfg.fixation_window) and (
+                    spread <= self.cfg.fixation_spread_u16
+                )
 
-                if self._locked:
-                    # Require sustained deliberate gaze shift outside unlock_radius_u16 to break lock
-                    if dist > self.cfg.unlock_radius_u16:
-                        self._escape_streak += 1
-                        if self._escape_streak >= self.cfg.unlock_confirm_frames:
-                            self._locked = False
-                            self._escape_streak = 0
-                            self._settle_streak = 0
-                    else:
-                        self._escape_streak = 0
+                if is_fixated:
+                    # Gaze truly STOPPED on (cx, cy)! Commit as new destination if far enough from current goal.
+                    if (abs(cx - self._goal_x) + abs(cy - self._goal_y)) > self.cfg.retarget_deadzone_u16:
+                        self._goal_x = cx
+                        self._goal_y = cy
+                        self._locked = False
+                        self._motion_state = "gliding"
+                else:
+                    # Eyes are darting / scanning across the screen -> DO NOT update destination!
+                    if self._locked:
+                        self._motion_state = "scanning"
 
-                if not self._locked:
-                    if dist > self.cfg.deadzone_u16:
-                        boost = (dist - self.cfg.deadzone_u16) >> self.cfg.velocity_boost_shift
-                        alpha = min(self.cfg.alpha_max_q8, self.cfg.alpha_min_q8 + boost)
-                        step_x = max(-self.cfg.max_step_u16, min(self.cfg.max_step_u16, (dx * alpha) >> 8))
-                        step_y = max(-self.cfg.max_step_u16, min(self.cfg.max_step_u16, (dy * alpha) >> 8))
-                        self._x = max(0, min(65535, self._x + step_x))
-                        self._y = max(0, min(65535, self._y + step_y))
-
-                    # Once gaze settles inside settle_radius_u16, snap cleanly back to LOCKED!
-                    rem_dist = abs(mx - self._x) + abs(my - self._y)
-                    if rem_dist <= self.cfg.settle_radius_u16:
-                        self._settle_streak += 1
-                        if self._settle_streak >= self.cfg.settle_confirm_frames:
-                            self._locked = True
-                            self._settle_streak = 0
-                            self._escape_streak = 0
-                    else:
-                        self._settle_streak = 0
+                # Smoothly glide toward committed goal (if not yet arrived); otherwise stay 100% motionless!
+                dx = self._goal_x - self._x
+                dy = self._goal_y - self._y
+                rem = abs(dx) + abs(dy)
+                if rem <= self.cfg.arrival_radius_u16:
+                    self._x = self._goal_x
+                    self._y = self._goal_y
+                    self._locked = True
+                    self._motion_state = "locked" if is_fixated else "scanning"
+                else:
+                    self._locked = False
+                    self._motion_state = "gliding"
+                    step_x = (dx * self.cfg.glide_alpha_q8) >> 8
+                    step_y = (dy * self.cfg.glide_alpha_q8) >> 8
+                    if step_x == 0 and dx != 0:
+                        step_x = 1 if dx > 0 else -1
+                    if step_y == 0 and dy != 0:
+                        step_y = 1 if dy > 0 else -1
+                    step_x = max(-self.cfg.max_step_u16, min(self.cfg.max_step_u16, step_x))
+                    step_y = max(-self.cfg.max_step_u16, min(self.cfg.max_step_u16, step_y))
+                    self._x = max(0, min(65535, self._x + step_x))
+                    self._y = max(0, min(65535, self._y + step_y))
 
         return CursorDecision(
             x_u16=self._x,
@@ -240,4 +253,5 @@ class GazeCursorController:
             paused_by_user=False,
             hold_progress_pct=hold_pct,
             locked=self._locked,
+            motion_state=self._motion_state,
         )

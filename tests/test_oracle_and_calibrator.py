@@ -175,30 +175,58 @@ def test_fixation_lock_eliminates_micro_tremor_and_ear_click():
     assert d_op.click == "left_click"
 
 
-def test_sustained_intent_region_lock_rejects_glitches_and_relocks():
+def test_saccade_rejection_ignores_darting_eyes_and_glides_on_stop():
     ctrl = GazeCursorController(FilterConfig())
     d0 = ctrl.step(20000, 20000, -50, -50, now_ms=0)
     assert d0.locked is True
     assert (d0.x_u16, d0.y_u16) == (20000, 20000)
 
-    # Brief 3-frame glitch far away MUST NOT break the region lock!
-    for i in range(1, 4):
-        d = ctrl.step(48000, 48000, -50, -50, now_ms=i * 33)
-        assert d.locked is True
+    # Eyes dart wildly across the entire screen (scanning/reading) -> cursor MUST NOT MOVE (0 px)!
+    dart_pts = [
+        (52000, 12000), (14000, 48000), (60000, 55000), (10000, 10000),
+        (45000, 32000), (22000, 58000), (55000, 18000), (15000, 42000),
+        (49000, 50000), (18000, 14000), (58000, 38000), (12000, 54000),
+    ]
+    for i, (dx, dy) in enumerate(dart_pts, start=1):
+        d = ctrl.step(dx, dy, -50, -50, now_ms=i * 33)
         assert (d.x_u16, d.y_u16) == (20000, 20000)
+        assert d.motion_state == "scanning"
 
-    # Sustained intentional gaze move to (50000, 45000) unlocks, glides, and re-locks!
-    unlocked_seen = False
-    relocked_seen = False
-    for i in range(4, 45):
+    # Now eyes STOP calmly on (50000, 45000) -> cursor smoothly glides there and locks!
+    glided = False
+    relocked = False
+    base_i = len(dart_pts) + 1
+    for i in range(base_i, base_i + 50):
         d = ctrl.step(50000, 45000, -50, -50, now_ms=i * 33)
-        if not d.locked:
-            unlocked_seen = True
-        if unlocked_seen and d.locked:
-            relocked_seen = True
+        if d.motion_state == "gliding":
+            glided = True
+        if glided and d.motion_state == "locked":
+            relocked = True
             break
 
-    assert unlocked_seen is True
-    assert relocked_seen is True
-    assert abs(d.x_u16 - 50000) < 2000
-    assert abs(d.y_u16 - 45000) < 2000
+    assert glided is True
+    assert relocked is True
+    assert (d.x_u16, d.y_u16) == (50000, 45000)
+
+
+def test_online_q12_ai_learning_reduces_error_and_rejects_outliers():
+    cal = IntegerGazeCalibrator.identity_default()
+    feat = build_cal_feature(None, 0, 0, 20, -15, 5, -5, 5, -5, 10, -8)
+    px0, py0 = cal.predict_u16(None, 0, 0, 20, -15, 5, -5, 5, -5, 10, -8)
+
+    # Target shifted by +6000 u16 -> repeated online clicks should reduce error smoothly
+    target_x = min(65535, px0 + 6000)
+    target_y = max(0, py0 - 5000)
+    cur = cal
+    for _ in range(8):
+        cur, applied = cur.online_learn_step(feat, target_x, target_y)
+        assert applied is True
+    assert cur.online_updates == 8
+    px1, py1 = cur.predict_u16(None, 0, 0, 20, -15, 5, -5, 5, -5, 10, -8)
+    assert abs(px1 - target_x) < abs(px0 - target_x)
+    assert abs(py1 - target_y) < abs(py0 - target_y)
+
+    # Huge outlier click (>29% screen away) must be safely ignored
+    same, applied = cur.online_learn_step(feat, 0, 65535)
+    assert applied is False
+    assert same.online_updates == 8

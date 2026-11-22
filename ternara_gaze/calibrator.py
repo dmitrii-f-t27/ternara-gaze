@@ -137,6 +137,7 @@ class IntegerGazeCalibrator:
     ear_thresh_r: int = 165
     fit_mae_pct_x: float = 0.0
     fit_mae_pct_y: float = 0.0
+    online_updates: int = 0
 
     def __post_init__(self) -> None:
         if self.wx_q12.shape != (CAL_FEAT_DIM,) or self.wy_q12.shape != (CAL_FEAT_DIM,):
@@ -240,6 +241,64 @@ class IntegerGazeCalibrator:
         sy = int(np.dot(f, self.wy_q12.astype(np.int64))) >> Q_SHIFT
         return max(0, min(65535, sx)), max(0, min(65535, sy))
 
+
+    def online_learn_step(
+        self,
+        feat: np.ndarray,
+        target_x_u16: int,
+        target_y_u16: int,
+        lr: float = 0.14,
+        max_error_u16: int = 19000,
+    ) -> Tuple["IntegerGazeCalibrator", bool]:
+        """Safe bounded SNR-tiered NLMS online adaptation step (returns (updated_cal, applied)).
+
+        Triggered when the user clicks with their real mouse/trackpad or confirms a magnetically
+        locked UI button, continuously adapting the Q12 model to posture, lighting, and gaze habits.
+        """
+        f = np.asarray(feat, dtype=np.float64)
+        if f.shape != (CAL_FEAT_DIM,):
+            return self, False
+
+        pred_x = max(0, min(65535, int(np.dot(f.astype(np.int64), self.wx_q12.astype(np.int64))) >> Q_SHIFT))
+        pred_y = max(0, min(65535, int(np.dot(f.astype(np.int64), self.wy_q12.astype(np.int64))) >> Q_SHIFT))
+        tx = max(0, min(65535, int(target_x_u16)))
+        ty = max(0, min(65535, int(target_y_u16)))
+
+        ex = float(tx - pred_x)
+        ey = float(ty - pred_y)
+        # Safety guard: skip if user clicked without looking near the target (>29% screen away)
+        if abs(ex) > max_error_u16 or abs(ey) > max_error_u16:
+            return self, False
+
+        # SNR-tiered learning weights: strong adaptation on bias & nose/pose, gentle on eyes
+        tier_inv = np.array(
+            [1.0, 1.0, 1.0, 1.0, 0.28, 0.28, 0.22, 0.22, 0.06, 0.06, 0.04, 0.04, 0.04, 1.6],
+            dtype=np.float64,
+        )
+        denom = float(np.sum(tier_inv * (f * f))) + 8000.0
+        step_scale = (lr / denom) * float(Q_SCALE)
+        dwx = np.rint(ex * step_scale * tier_inv * f).astype(np.int64)
+        dwy = np.rint(ey * step_scale * tier_inv * f).astype(np.int64)
+
+        lim = (1 << 30) - 1
+        new_wx = np.clip(self.wx_q12.astype(np.int64) + dwx, -lim, lim).astype(np.int32)
+        new_wy = np.clip(self.wy_q12.astype(np.int64) + dwy, -lim, lim).astype(np.int32)
+
+        return (
+            IntegerGazeCalibrator(
+                wx_q12=new_wx,
+                wy_q12=new_wy,
+                blink_thresh_l=self.blink_thresh_l,
+                blink_thresh_r=self.blink_thresh_r,
+                ear_thresh_l=self.ear_thresh_l,
+                ear_thresh_r=self.ear_thresh_r,
+                fit_mae_pct_x=self.fit_mae_pct_x,
+                fit_mae_pct_y=self.fit_mae_pct_y,
+                online_updates=self.online_updates + 1,
+            ),
+            True,
+        )
+
     def save(self, path: str | Path) -> None:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -255,6 +314,7 @@ class IntegerGazeCalibrator:
             "ear_thresh_r": int(self.ear_thresh_r),
             "fit_mae_pct_x": self.fit_mae_pct_x,
             "fit_mae_pct_y": self.fit_mae_pct_y,
+            "online_updates": int(self.online_updates),
         }
         p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -272,4 +332,5 @@ class IntegerGazeCalibrator:
             ear_thresh_r=int(data.get("ear_thresh_r", 165)),
             fit_mae_pct_x=float(data.get("fit_mae_pct_x", 0.0)),
             fit_mae_pct_y=float(data.get("fit_mae_pct_y", 0.0)),
+            online_updates=int(data.get("online_updates", 0)),
         )
